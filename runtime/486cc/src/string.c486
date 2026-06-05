@@ -1,0 +1,12 @@
+void* memcpy(void* dst, const void* src, unsigned int n) {
+    char* d = (char*)dst;
+    const char* s = (const char*)src;
+    while (n) { *d = *s; d = d + 1; s = s + 1; n = n - 1; }
+    return dst;
+}
+
+void* memset(void* dst, int value, unsigned int n) {
+    char* d = (char*)dst;
+    while (n) { *d = (char)value; d = d + 1; n = n - 1; }
+    return dst;
+}
