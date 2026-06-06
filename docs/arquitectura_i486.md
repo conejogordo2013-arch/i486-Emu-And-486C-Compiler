@@ -138,3 +138,23 @@ La pasada actual amplía también el flujo completo `486CC -> 486AS -> 486LD -> 
       |                                             |
       +---------- tests/compiler -------------------+--> PC486Emulator devices
 ```
+
+## Integración i486 adicional (ISA + comportamiento)
+
+La última integración aumenta la fidelidad funcional del núcleo y del toolchain en tres áreas:
+
+- **Prefijos y flujo de bytes**: el decodificador reconoce `LOCK`, `REP/REPE/REPNE`, prefijos de segmento y conmutación de operand/address-size. `LOCK` contabiliza ciclos bloqueados y `REP` ejecuta las instrucciones de cadena contra `ECX/CX`.
+- **ALU/flags 8086-486**: se cubren `ADC`, `SBB`, `CLC`, `STC`, `CMC`, `CLD`, `STD`, `LAHF`, `SAHF`, `CWDE/CBW`, además de `RCL/RCR` para rotaciones through-carry. Esto mejora compatibilidad con código legacy 8086/286/386.
+- **String/data movement**: `MOVS`, `CMPS`, `STOS`, `LODS`, `SCAS` funcionan en variantes byte/dword con dirección controlada por `DF`; `XLAT` permite tablas legacy `DS:[EBX+AL]`; `MOV Sreg,r/m16` y `MOV r/m16,Sreg` exponen CS/DS/SS/ES/FS/GS al ISA.
+- **Sistema i486**: `CLTS`, `INVD`, `WBINVD`, `SLDT`, `STR`, `LLDT`, `LTR` y `MOV DRx` están cableados junto a `MOV CRx`, `LGDT/LIDT/SGDT/SIDT`, `SMSW/LMSW` e `INVLPG`.
+- **Modelo L1/pipeline**: se añadió una caché L1 unificada de 8 KiB con líneas de 16 bytes. Las lecturas/escrituras de operandos de memoria contabilizan hits/misses, stalls y flushes de prefetch; `INVD/WBINVD` invalidan este modelo y `WBINVD` contabiliza write-back de líneas sucias.
+- **Addressing 16/32**: el prefijo `0x67` activa las formas ModR/M de 16 bits (`BX+SI`, `BX+DI`, `BP+SI`, `BP+DI`, `SI`, `DI`, `BP`, `BX`) sin perder SIB de 32 bits cuando el prefijo no está activo.
+- **Assembler 486AS**: el ensamblador acepta las nuevas instrucciones (`adc/sbb`, `rcl/rcr`, flags, `rep movsd/stosd/...`, `invd/wbinvd`, `clts`, descriptor-table ops, `lldt/ltr/sldt/str`, segment-register moves) para que `486CC` pueda usarlas desde bloques `asm { ... }`.
+
+Estas rutas no convierten aún al proyecto en una réplica bit-exacta de todo Intel 80486; sí cierran más brechas de ISA y dejan instrumentación verificable para caché, prefetch y LOCK.
+
+### Segunda ampliación de cobertura ISA/toolchain
+
+- **x87 ampliado**: el emulador acepta ahora constantes x87 (`FLD1`, `FLDZ`, `FLDPI`, `FLDL2T`, `FLDL2E`, `FLDLG2`, `FLDLN2`), operaciones de signo/valor absoluto, `FTST`, `FXAM`, `FSIN`, `FCOS`, `FSINCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`, `FYL2XP1`, `FINIT/FNINIT`, `FSTCW/FLDCW`, `FSTSW`, `FILD/FIST/FISTP`, `FXCH`, `FFREE` y `FST/FSTP ST(i)` en una semántica funcional simplificada.
+- **Punteros far y segmentos**: se incorporan `LDS`, `LES`, `LFS`, `LGS` y `LSS`, además de `PUSH/POP FS/GS`, para cubrir más código 286/386/486 que manipula selectores explícitamente.
+- **486AS**: el assembler ahora emite estas operaciones x87, `WAIT/FWAIT`, `INTO`, cadenas word (`MOVSW`, `STOSW`, `LODSW`, `CMPSW`, `SCASW`), cargas far y `push/pop` de segmentos. Esto permite a `486CC` acceder al bloque ISA ampliado desde `asm { ... }` sin escribir bytes manuales.

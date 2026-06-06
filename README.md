@@ -131,3 +131,9 @@ El emulador instala estos dispositivos en el `IOBus`:
 ## Precisión del i486
 
 La CPU incluye registros generales, segmentos, `EIP`, `EFLAGS`, control `CR0..CR4`, x87, prefijos, ModRM/SIB, interrupciones reales, una IDT simplificada en protected mode, paging con TLB y excepciones de página. El objetivo de diseño es modularidad y pruebas: completar una ISA i486 absolutamente perfecta requiere seguir ampliando tablas de opcodes, gates del modo protegido, FPU x87 completa, timing ciclo-a-ciclo, cachés y comportamiento exacto de chipset.
+
+### i486 ISA fidelity update
+
+The emulator/toolchain now includes a wider 80486 compatibility slice: ADC/SBB, through-carry rotates, LAHF/SAHF and flag-control instructions, REP string operations, segment-register moves, 16-bit ModR/M addressing under `0x67`, debug-register moves, cache-control (`INVD`/`WBINVD`), `CLTS`, descriptor selector ops (`SLDT/STR/LLDT/LTR`), and a simple 8 KiB unified L1 cache/timing model. The assembler accepts these mnemonics directly, and 486CC can reach them through `asm { ... }` blocks.
+
+The follow-up ISA pass also broadens x87 and segmented legacy support: x87 constants/transcendentals/control words, integer FPU transfers, `LDS/LES/LFS/LGS/LSS`, `WAIT/FWAIT`, `INTO`, word string mnemonics, and segment `push/pop` now assemble and execute in the functional model.

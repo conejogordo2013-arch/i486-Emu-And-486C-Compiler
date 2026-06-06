@@ -2,6 +2,7 @@
 #include "c486cc/compiler.hpp"
 #include <cassert>
 #include <cstring>
+#include <cmath>
 #include <iostream>
 
 using namespace i486;
@@ -261,6 +262,106 @@ void test_486cc_for_inline_asm_bitwise_and_devices() {
     assert(emu.pic->pending_irq() == 4);
 }
 
+
+void test_expanded_i486_isa_realism() {
+    c486cc::Assembler486 assembler;
+    const auto image = assembler.assemble_flat(R"asm(
+        bits 32
+        global _start
+    _start:
+        cld
+        mov edi, 0x4000
+        mov eax, 0x11223344
+        mov ecx, 2
+        rep stosd
+        mov esi, 0x4000
+        mov edi, 0x5000
+        mov ecx, 2
+        rep movsd
+        stc
+        mov eax, 1
+        adc eax, 1
+        stc
+        sbb eax, 1
+        cmc
+        lahf
+        sahf
+        mov ebx, 0x12345678
+        mov cl, 1
+        rcl ebx, cl
+        invd
+        wbinvd
+        hlt
+    )asm");
+    Memory mem;
+    IOBus io;
+    CPU486 cpu(mem, io);
+    cpu.reset();
+    mem.load(0x7C00, image);
+    for (int i = 0; i < 64 && !cpu.halted; ++i) cpu.step();
+    assert(cpu.halted);
+    assert(mem.read_physical(0x4000, 4) == 0x11223344u);
+    assert(mem.read_physical(0x4004, 4) == 0x11223344u);
+    assert(mem.read_physical(0x5000, 4) == 0x11223344u);
+    assert(mem.read_physical(0x5004, 4) == 0x11223344u);
+    assert(cpu.regs.get8(0) == 1);
+    assert(cpu.timing.prefetch_flushes >= 2);
+    assert(cpu.timing.cache_misses > 0);
+}
+
+
+void test_more_isa_assembler_fpu_far_pointer() {
+    c486cc::Assembler486 assembler;
+    const auto image = assembler.assemble_flat(R"asm(
+        bits 32
+        global _start
+    _start:
+        fldpi
+        fsin
+        fstp [0x6000]
+        fld1
+        fchs
+        fabs
+        fstp [0x6008]
+        fild [0x6020]
+        fistp [0x6024]
+        les eax, [0x6100]
+        lfs ebx, [0x6108]
+        mov ecx, cr0
+        mov dr0, ecx
+        mov edx, dr0
+        push fs
+        pop gs
+        wait
+        into
+        hlt
+    )asm");
+    Memory mem;
+    IOBus io;
+    CPU486 cpu(mem, io);
+    cpu.reset();
+    mem.write_physical(0x6020, 42, 4);
+    mem.write_physical(0x6100, 0xAABBCCDDu, 4);
+    mem.write_physical(0x6104, 0x1234, 2);
+    mem.write_physical(0x6108, 0x11223344u, 4);
+    mem.write_physical(0x610C, 0x5678, 2);
+    mem.load(0x7C00, image);
+    for (int i = 0; i < 64 && !cpu.halted; ++i) cpu.step();
+    assert(cpu.halted);
+    double sin_pi = 1.0;
+    auto raw_sin = mem.read_physical(0x6000, 8);
+    std::memcpy(&sin_pi, &raw_sin, sizeof(sin_pi));
+    assert(std::fabs(sin_pi) < 1e-12);
+    double abs_one = 0.0;
+    auto raw_abs = mem.read_physical(0x6008, 8);
+    std::memcpy(&abs_one, &raw_abs, sizeof(abs_one));
+    assert(abs_one == 1.0);
+    assert(mem.read_physical(0x6024, 4) == 42);
+    assert(cpu.regs.eax == 0xAABBCCDDu && cpu.regs.es == 0x1234);
+    assert(cpu.regs.ebx == 0x11223344u && cpu.regs.fs == 0x5678 && cpu.regs.gs == 0x5678);
+    assert(cpu.regs.edx == cpu.regs.cr0);
+}
+
 void test_assembler_and_linker_pipeline() {
     c486cc::Assembler486 assembler;
     const auto image = assembler.assemble_flat(R"asm(
@@ -304,6 +405,8 @@ int main() {
     test_boot_vga_sb16_interrupt();
     test_486cc_compiler_pipeline();
     test_486cc_for_inline_asm_bitwise_and_devices();
+    test_expanded_i486_isa_realism();
+    test_more_isa_assembler_fpu_far_pointer();
     test_assembler_and_linker_pipeline();
     std::cout << "i486 C++ emulator tests OK\n";
     return 0;
