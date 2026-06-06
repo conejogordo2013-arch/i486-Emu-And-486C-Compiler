@@ -92,6 +92,8 @@ private:
 
     std::uint32_t read_rm32(const ModRM& modrm);
     void write_rm32(const ModRM& modrm, std::uint32_t value);
+    std::uint16_t read_rm16(const ModRM& modrm);
+    void write_rm16(const ModRM& modrm, std::uint16_t value);
     std::uint8_t read_rm8(const ModRM& modrm);
     void write_rm8(const ModRM& modrm, std::uint8_t value);
 
@@ -103,6 +105,8 @@ private:
     void execute_opcode(std::uint8_t opcode);
     void execute_extended();
     void execute_group1(std::uint8_t opcode);
+    void execute_group2(std::uint8_t opcode);
+    void execute_group3(std::uint8_t opcode);
     void execute_fpu(std::uint8_t opcode);
     bool condition(std::uint8_t jcc) const;
 };

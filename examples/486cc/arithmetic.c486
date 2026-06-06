@@ -1,0 +1,7 @@
+int main() {
+    int a = 7;
+    int b = 4;
+    int r = a % b;
+    if (r == 3) return 1;
+    return 0;
+}

@@ -219,8 +219,6 @@ IRModule IRBuilder::build(const TranslationUnit& unit) {
     IRModule module;
     for (const auto& fn : unit.functions) {
         IRFunction irfn; irfn.name = fn.name; irfn.return_type = fn.return_type; irfn.params = fn.params; current_ = &irfn; temp_ = 0;
-        int offset = -4;
-        for (const auto& param : fn.params) { current_->locals[param.name] = offset; offset -= 4; }
         Stmt wrapper; wrapper.node = CompoundStmt{};
         for (const auto& stmt : fn.body->statements) emit_stmt(*stmt);
         if (irfn.code.empty() || irfn.code.back().op != IROp::Ret) irfn.code.push_back({IROp::Ret, "0"});
@@ -235,7 +233,7 @@ std::string IRBuilder::emit_expr(const Expr& expr) {
     if (auto n = std::get_if<BinaryExpr>(&expr.node)) {
         if (n->op == "=") { auto rhs = emit_expr(*n->rhs); auto* var = std::get_if<VariableExpr>(&n->lhs->node); if (!var) throw CompileError("assignment target must be a variable in current IR core"); current_->code.push_back({IROp::Mov, var->name, rhs}); return var->name; }
         auto lhs = emit_expr(*n->lhs); auto rhs = emit_expr(*n->rhs); auto out = temp();
-        IROp op = n->op == "+" ? IROp::Add : n->op == "-" ? IROp::Sub : n->op == "*" ? IROp::Mul : n->op == "/" ? IROp::Div : IROp::Cmp;
+        IROp op = n->op == "+" ? IROp::Add : n->op == "-" ? IROp::Sub : n->op == "*" ? IROp::Mul : n->op == "/" ? IROp::Div : n->op == "%" ? IROp::Mod : IROp::Cmp;
         current_->code.push_back({op, out, lhs, rhs, n->op}); return out;
     }
     if (auto n = std::get_if<CallExpr>(&expr.node)) { for (auto it = n->args.rbegin(); it != n->args.rend(); ++it) current_->code.push_back({IROp::Mov, "push", emit_expr(**it)}); auto out = temp(); current_->code.push_back({IROp::Call, out, n->callee}); return out; }
@@ -253,21 +251,39 @@ void IRBuilder::emit_stmt(const Stmt& stmt) {
 void Optimizer::optimize(IRModule& module) { for (auto& fn : module.functions) { fold_constants(fn); remove_dead_after_ret(fn); simplify_jumps(fn); } }
 void Optimizer::fold_constants(IRFunction& fn) {
     for (auto& i : fn.code) {
-        if ((i.op == IROp::Add || i.op == IROp::Sub || i.op == IROp::Mul || i.op == IROp::Div) && is_number(i.a) && is_number(i.b)) {
+        if ((i.op == IROp::Add || i.op == IROp::Sub || i.op == IROp::Mul || i.op == IROp::Div || i.op == IROp::Mod || i.op == IROp::Cmp) && is_number(i.a) && is_number(i.b)) {
             auto a = std::stoll(i.a), b = std::stoll(i.b), r = 0LL;
-            if (i.op == IROp::Add) r = a + b; else if (i.op == IROp::Sub) r = a - b; else if (i.op == IROp::Mul) r = a * b; else r = b ? a / b : 0;
+            if (i.op == IROp::Add) r = a + b; else if (i.op == IROp::Sub) r = a - b; else if (i.op == IROp::Mul) r = a * b; else if (i.op == IROp::Div) r = b ? a / b : 0; else if (i.op == IROp::Mod) r = b ? a % b : 0; else if (i.label == "==") r = a == b; else if (i.label == "!=") r = a != b; else if (i.label == "<") r = a < b; else if (i.label == "<=") r = a <= b; else if (i.label == ">") r = a > b; else if (i.label == ">=") r = a >= b;
             i.op = IROp::Mov; i.a = std::to_string(r); i.b.clear();
         }
     }
 }
 void Optimizer::remove_dead_after_ret(IRFunction& fn) { bool dead = false; std::vector<IRInst> out; for (auto& i : fn.code) { if (dead && i.op != IROp::Label) continue; out.push_back(i); dead = i.op == IROp::Ret; } fn.code = std::move(out); }
-void Optimizer::simplify_jumps(IRFunction& fn) { for (std::size_t i = 0; i + 1 < fn.code.size(); ++i) if (fn.code[i].op == IROp::Jmp && fn.code[i + 1].op == IROp::Label && fn.code[i].label == fn.code[i + 1].label) fn.code[i].op = IROp::Mov; }
+void Optimizer::simplify_jumps(IRFunction& fn) {
+    std::vector<IRInst> out;
+    for (std::size_t i = 0; i < fn.code.size(); ++i) {
+        if (i + 1 < fn.code.size() && fn.code[i].op == IROp::Jmp && fn.code[i + 1].op == IROp::Label && fn.code[i].label == fn.code[i + 1].label) continue;
+        out.push_back(fn.code[i]);
+    }
+    fn.code = std::move(out);
+}
 
 std::string AsmGenerator486::generate(const IRModule& module) const { std::ostringstream out; out << "bits 32\nsection .text\n"; for (const auto& fn : module.functions) out << emit_function(fn); return out.str(); }
 std::string AsmGenerator486::emit_function(const IRFunction& fn) const {
     std::ostringstream out; out << "global " << fn.name << "\n" << fn.name << ":\n  push ebp\n  mov ebp, esp\n";
-    const int frame = static_cast<int>(fn.locals.size()) * 4; if (frame) out << "  sub esp, " << frame << "\n";
-    auto operand = [&](const std::string& v) { auto it = fn.locals.find(v); if (it != fn.locals.end()) return std::string("[ebp") + std::to_string(it->second) + "]"; return v; };
+    auto slots = fn.locals;
+    auto ensure_slot = [&](const std::string& v) {
+        if (v.empty() || is_number(v) || v == "push") return;
+        if (slots.find(v) == slots.end() && v.rfind("%t", 0) == 0) slots[v] = -4 * (static_cast<int>(slots.size()) + 1);
+    };
+    for (const auto& i : fn.code) { ensure_slot(i.dst); ensure_slot(i.a); ensure_slot(i.b); }
+    const int frame = static_cast<int>(slots.size()) * 4; if (frame) out << "  sub esp, " << frame << "\n";
+    auto operand = [&](const std::string& v) {
+        auto it = slots.find(v); if (it != slots.end()) return std::string("[ebp") + std::to_string(it->second) + "]";
+        for (std::size_t idx = 0; idx < fn.params.size(); ++idx) if (fn.params[idx].name == v) return std::string("[ebp+") + std::to_string(8 + static_cast<int>(idx) * 4) + "]";
+        return v;
+    };
+    auto setcc = [](const std::string& op) { if (op == "!=") return "setne"; if (op == "<") return "setl"; if (op == "<=") return "setle"; if (op == ">") return "setg"; if (op == ">=") return "setge"; return "sete"; };
     for (const auto& i : fn.code) {
         switch (i.op) {
         case IROp::Label: out << i.label << ":\n"; break;
@@ -275,8 +291,17 @@ std::string AsmGenerator486::emit_function(const IRFunction& fn) const {
         case IROp::Add: out << "  mov eax, " << operand(i.a) << "\n  add eax, " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
         case IROp::Sub: out << "  mov eax, " << operand(i.a) << "\n  sub eax, " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
         case IROp::Mul: out << "  mov eax, " << operand(i.a) << "\n  imul eax, " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
-        case IROp::Div: out << "  mov eax, " << operand(i.a) << "\n  cdq\n  idiv dword " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
-        case IROp::Cmp: out << "  mov eax, " << operand(i.a) << "\n  cmp eax, " << operand(i.b) << "\n  sete al\n  movzx eax, al\n  mov " << operand(i.dst) << ", eax\n"; break;
+        case IROp::Div:
+            out << "  mov eax, " << operand(i.a) << "\n  cdq\n";
+            if (is_number(i.b)) out << "  mov ecx, " << i.b << "\n  idiv ecx\n"; else out << "  idiv dword " << operand(i.b) << "\n";
+            out << "  mov " << operand(i.dst) << ", eax\n";
+            break;
+        case IROp::Mod:
+            out << "  mov eax, " << operand(i.a) << "\n  cdq\n";
+            if (is_number(i.b)) out << "  mov ecx, " << i.b << "\n  idiv ecx\n"; else out << "  idiv dword " << operand(i.b) << "\n";
+            out << "  mov " << operand(i.dst) << ", edx\n";
+            break;
+        case IROp::Cmp: out << "  mov eax, " << operand(i.a) << "\n  cmp eax, " << operand(i.b) << "\n  " << setcc(i.label) << " al\n  movzx eax, al\n  mov " << operand(i.dst) << ", eax\n"; break;
         case IROp::Jmp: out << "  jmp " << i.label << "\n"; break;
         case IROp::Jcc: out << "  cmp " << operand(i.a) << ", " << operand(i.b) << "\n  je " << i.label << "\n"; break;
         case IROp::Call: out << "  call " << i.a << "\n  mov " << operand(i.dst) << ", eax\n"; break;

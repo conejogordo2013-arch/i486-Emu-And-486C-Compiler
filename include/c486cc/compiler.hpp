@@ -125,7 +125,7 @@ private:
     ExprPtr parse_primary();
 };
 
-enum class IROp { Label, Mov, Load, Store, Add, Sub, Mul, Div, Cmp, Jmp, Jcc, Call, Ret };
+enum class IROp { Label, Mov, Load, Store, Add, Sub, Mul, Div, Mod, Cmp, Jmp, Jcc, Call, Ret };
 
 struct IRInst {
     IROp op = IROp::Mov;
@@ -183,6 +183,30 @@ struct CompileResult {
 class Compiler486CC {
 public:
     CompileResult compile_to_asm(const std::string& source);
+};
+
+struct AsmSymbol { std::string name; std::uint32_t address = 0; bool global = false; };
+struct AsmRelocation { std::uint32_t offset = 0; std::string symbol; std::int32_t addend = 0; std::uint8_t size = 4; bool relative = false; };
+struct ObjectSection { std::string name = ".text"; std::vector<std::uint8_t> data; std::uint32_t base = 0; };
+struct ObjectFile { std::vector<ObjectSection> sections; std::vector<AsmSymbol> symbols; std::vector<AsmRelocation> relocations; };
+
+class Assembler486 {
+public:
+    ObjectFile assemble(const std::string& source) const;
+    std::vector<std::uint8_t> assemble_flat(const std::string& source, std::uint32_t base = 0x7C00) const;
+};
+
+class Linker486 {
+public:
+    std::vector<std::uint8_t> link_flat(const std::vector<ObjectFile>& objects, std::uint32_t base = 0x7C00) const;
+};
+
+class Toolchain486 {
+public:
+    CompileResult compile_c486_to_asm(const std::string& source) const;
+    ObjectFile assemble(const std::string& assembly) const;
+    std::vector<std::uint8_t> link_flat(const std::vector<ObjectFile>& objects, std::uint32_t base = 0x7C00) const;
+    std::vector<std::uint8_t> build_c486_flat(const std::string& source, std::uint32_t base = 0x7C00) const;
 };
 
 } // namespace c486cc
