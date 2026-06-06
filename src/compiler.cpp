@@ -13,9 +13,17 @@ TokenKind keyword_kind(const std::string& text) {
         {"struct", TokenKind::KwStruct}, {"if", TokenKind::KwIf}, {"else", TokenKind::KwElse},
         {"while", TokenKind::KwWhile}, {"for", TokenKind::KwFor}, {"switch", TokenKind::KwSwitch},
         {"case", TokenKind::KwCase}, {"default", TokenKind::KwDefault}, {"return", TokenKind::KwReturn},
+        {"asm", TokenKind::KwAsm},
     };
     const auto it = keywords.find(text);
     return it == keywords.end() ? TokenKind::Identifier : it->second;
+}
+
+std::string trim_copy(std::string s) {
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    return s;
 }
 
 bool is_number(const std::string& s) {
@@ -81,6 +89,11 @@ Token Lexer::next() {
     if (std::isdigit(static_cast<unsigned char>(c))) {
         std::string text;
         bool has_dot = false;
+        if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X')) {
+            text.push_back(get()); text.push_back(get());
+            while (std::isxdigit(static_cast<unsigned char>(peek()))) text.push_back(get());
+            return {TokenKind::Integer, text, start};
+        }
         while (std::isdigit(static_cast<unsigned char>(peek())) || (!has_dot && peek() == '.')) {
             if (peek() == '.') has_dot = true;
             text.push_back(get());
@@ -183,22 +196,55 @@ std::unique_ptr<CompoundStmt> Parser::parse_compound() {
 }
 StmtPtr Parser::parse_statement() {
     if (match(TokenKind::KwReturn)) { auto value = parse_expression(); expect(TokenKind::Semicolon, "expected ';'"); return make_stmt(ReturnStmt{std::move(value)}); }
+    if (match(TokenKind::KwAsm)) {
+        expect(TokenKind::LBrace, "expected '{' after asm");
+        std::ostringstream asm_text;
+        while (!match(TokenKind::RBrace)) {
+            if (peek().kind == TokenKind::End) throw CompileError("unterminated asm block");
+            if (match(TokenKind::Semicolon)) { asm_text << '\n'; continue; }
+            auto token = tokens_[pos_++];
+            asm_text << token.text;
+            if (peek().kind != TokenKind::Comma && peek().kind != TokenKind::Semicolon && peek().kind != TokenKind::RBracket && token.kind != TokenKind::LBracket) asm_text << ' ';
+        }
+        return make_stmt(InlineAsmStmt{asm_text.str()});
+    }
     if (match(TokenKind::KwIf)) { expect(TokenKind::LParen, "expected '('"); auto cond = parse_expression(); expect(TokenKind::RParen, "expected ')'"); auto then_s = parse_statement(); StmtPtr else_s; if (match(TokenKind::KwElse)) else_s = parse_statement(); return make_stmt(IfStmt{std::move(cond), std::move(then_s), std::move(else_s)}); }
     if (match(TokenKind::KwWhile)) { expect(TokenKind::LParen, "expected '('"); auto cond = parse_expression(); expect(TokenKind::RParen, "expected ')'"); return make_stmt(WhileStmt{std::move(cond), parse_statement()}); }
+    if (match(TokenKind::KwFor)) {
+        expect(TokenKind::LParen, "expected '('");
+        StmtPtr init;
+        if (!match(TokenKind::Semicolon)) {
+            if (at_type()) { Type type = parse_type(); auto decl = parse_var_decl_after_type(std::move(type)); expect(TokenKind::Semicolon, "expected ';'"); init = make_stmt(std::move(decl)); }
+            else { auto e = parse_expression(); expect(TokenKind::Semicolon, "expected ';'"); init = make_stmt(ExprStmt{std::move(e)}); }
+        }
+        ExprPtr cond;
+        if (!match(TokenKind::Semicolon)) { cond = parse_expression(); expect(TokenKind::Semicolon, "expected ';'"); }
+        ExprPtr inc;
+        if (!match(TokenKind::RParen)) { inc = parse_expression(); expect(TokenKind::RParen, "expected ')'"); }
+        return make_stmt(ForStmt{std::move(init), std::move(cond), std::move(inc), parse_statement()});
+    }
     if (peek().kind == TokenKind::LBrace) { auto compound = parse_compound(); return make_stmt(CompoundStmt{std::move(compound->statements)}); }
     if (at_type()) { Type type = parse_type(); auto decl = parse_var_decl_after_type(std::move(type)); expect(TokenKind::Semicolon, "expected ';'"); return make_stmt(std::move(decl)); }
     auto expr = parse_expression(); expect(TokenKind::Semicolon, "expected ';'"); return make_stmt(ExprStmt{std::move(expr)});
 }
 VarDecl Parser::parse_var_decl_after_type(Type type) { std::string name = expect(TokenKind::Identifier, "expected variable name").text; ExprPtr init; if (match(TokenKind::Assign)) init = parse_expression(); return {std::move(type), std::move(name), std::move(init)}; }
 ExprPtr Parser::parse_expression() { return parse_assignment(); }
-ExprPtr Parser::parse_assignment() { auto lhs = parse_equality(); if (match(TokenKind::Assign)) return make_binary("=", std::move(lhs), parse_assignment()); return lhs; }
+ExprPtr Parser::parse_assignment() { auto lhs = parse_logical_or(); if (match(TokenKind::Assign)) return make_binary("=", std::move(lhs), parse_assignment()); return lhs; }
+ExprPtr Parser::parse_logical_or() { auto e = parse_logical_and(); while (match(TokenKind::OrOr)) e = make_binary("||", std::move(e), parse_logical_and()); return e; }
+ExprPtr Parser::parse_logical_and() { auto e = parse_bitwise_or(); while (match(TokenKind::AndAnd)) e = make_binary("&&", std::move(e), parse_bitwise_or()); return e; }
+ExprPtr Parser::parse_bitwise_or() { auto e = parse_bitwise_xor(); while (match(TokenKind::Pipe)) e = make_binary("|", std::move(e), parse_bitwise_xor()); return e; }
+ExprPtr Parser::parse_bitwise_xor() { auto e = parse_bitwise_and(); while (match(TokenKind::Caret)) e = make_binary("^", std::move(e), parse_bitwise_and()); return e; }
+ExprPtr Parser::parse_bitwise_and() { auto e = parse_equality(); while (match(TokenKind::Amp)) e = make_binary("&", std::move(e), parse_equality()); return e; }
 ExprPtr Parser::parse_equality() { auto e = parse_relational(); while (peek().kind == TokenKind::Eq || peek().kind == TokenKind::Ne) { std::string op = match(TokenKind::Eq) ? "==" : (expect(TokenKind::Ne, "").text); e = make_binary(op, std::move(e), parse_relational()); } return e; }
 ExprPtr Parser::parse_relational() { auto e = parse_additive(); while (peek().kind == TokenKind::Lt || peek().kind == TokenKind::Le || peek().kind == TokenKind::Gt || peek().kind == TokenKind::Ge) { std::string op = peek().text; ++pos_; e = make_binary(op, std::move(e), parse_additive()); } return e; }
 ExprPtr Parser::parse_additive() { auto e = parse_multiplicative(); while (peek().kind == TokenKind::Plus || peek().kind == TokenKind::Minus) { std::string op = peek().text; ++pos_; e = make_binary(op, std::move(e), parse_multiplicative()); } return e; }
 ExprPtr Parser::parse_multiplicative() { auto e = parse_unary(); while (peek().kind == TokenKind::Star || peek().kind == TokenKind::Slash || peek().kind == TokenKind::Percent) { std::string op = peek().text; ++pos_; e = make_binary(op, std::move(e), parse_unary()); } return e; }
 ExprPtr Parser::parse_unary() { if (peek().kind == TokenKind::Minus || peek().kind == TokenKind::Bang || peek().kind == TokenKind::Star || peek().kind == TokenKind::Amp) { std::string op = peek().text; ++pos_; auto e = std::make_unique<Expr>(); e->node = UnaryExpr{op, parse_unary()}; return e; } return parse_primary(); }
 ExprPtr Parser::parse_primary() {
-    if (peek().kind == TokenKind::Integer) return make_int(std::stoll(expect(TokenKind::Integer, "").text));
+    if (peek().kind == TokenKind::Integer) {
+        auto text = expect(TokenKind::Integer, "").text;
+        return make_int(std::stoll(text, nullptr, (text.rfind("0x", 0) == 0 || text.rfind("0X", 0) == 0) ? 16 : 10));
+    }
     if (peek().kind == TokenKind::CharLiteral) return make_int(expect(TokenKind::CharLiteral, "").text[0]);
     if (peek().kind == TokenKind::Identifier) {
         std::string name = expect(TokenKind::Identifier, "").text;
@@ -229,11 +275,17 @@ IRModule IRBuilder::build(const TranslationUnit& unit) {
 std::string IRBuilder::emit_expr(const Expr& expr) {
     if (auto n = std::get_if<IntegerExpr>(&expr.node)) return std::to_string(n->value);
     if (auto n = std::get_if<VariableExpr>(&expr.node)) return n->name;
-    if (auto n = std::get_if<UnaryExpr>(&expr.node)) { auto v = emit_expr(*n->expr); if (n->op == "-") { auto out = temp(); current_->code.push_back({IROp::Sub, out, "0", v}); return out; } return v; }
+    if (auto n = std::get_if<UnaryExpr>(&expr.node)) {
+        auto v = emit_expr(*n->expr);
+        if (n->op == "-") { auto out = temp(); current_->code.push_back({IROp::Sub, out, "0", v}); return out; }
+        if (n->op == "!") { auto out = temp(); current_->code.push_back({IROp::Cmp, out, v, "0", "=="}); return out; }
+        if (n->op == "~") { auto out = temp(); current_->code.push_back({IROp::Xor, out, v, "-1"}); return out; }
+        return v;
+    }
     if (auto n = std::get_if<BinaryExpr>(&expr.node)) {
         if (n->op == "=") { auto rhs = emit_expr(*n->rhs); auto* var = std::get_if<VariableExpr>(&n->lhs->node); if (!var) throw CompileError("assignment target must be a variable in current IR core"); current_->code.push_back({IROp::Mov, var->name, rhs}); return var->name; }
         auto lhs = emit_expr(*n->lhs); auto rhs = emit_expr(*n->rhs); auto out = temp();
-        IROp op = n->op == "+" ? IROp::Add : n->op == "-" ? IROp::Sub : n->op == "*" ? IROp::Mul : n->op == "/" ? IROp::Div : n->op == "%" ? IROp::Mod : IROp::Cmp;
+        IROp op = n->op == "+" ? IROp::Add : n->op == "-" ? IROp::Sub : n->op == "*" ? IROp::Mul : n->op == "/" ? IROp::Div : n->op == "%" ? IROp::Mod : n->op == "&" || n->op == "&&" ? IROp::And : n->op == "|" || n->op == "||" ? IROp::Or : n->op == "^" ? IROp::Xor : IROp::Cmp;
         current_->code.push_back({op, out, lhs, rhs, n->op}); return out;
     }
     if (auto n = std::get_if<CallExpr>(&expr.node)) { for (auto it = n->args.rbegin(); it != n->args.rend(); ++it) current_->code.push_back({IROp::Mov, "push", emit_expr(**it)}); auto out = temp(); current_->code.push_back({IROp::Call, out, n->callee}); return out; }
@@ -245,15 +297,17 @@ void IRBuilder::emit_stmt(const Stmt& stmt) {
     if (auto n = std::get_if<ExprStmt>(&stmt.node)) { emit_expr(*n->expr); return; }
     if (auto n = std::get_if<CompoundStmt>(&stmt.node)) { for (const auto& s : n->statements) emit_stmt(*s); return; }
     if (auto n = std::get_if<IfStmt>(&stmt.node)) { auto else_l = label("else"); auto end_l = label("endif"); auto c = emit_expr(*n->condition); current_->code.push_back({IROp::Jcc, "z", c, "0", else_l}); emit_stmt(*n->then_branch); current_->code.push_back({IROp::Jmp, "", "", "", end_l}); current_->code.push_back({IROp::Label, "", "", "", else_l}); if (n->else_branch) emit_stmt(*n->else_branch); current_->code.push_back({IROp::Label, "", "", "", end_l}); return; }
-    if (auto n = std::get_if<WhileStmt>(&stmt.node)) { auto start = label("while"); auto end = label("endwhile"); current_->code.push_back({IROp::Label, "", "", "", start}); auto c = emit_expr(*n->condition); current_->code.push_back({IROp::Jcc, "z", c, "0", end}); emit_stmt(*n->body); current_->code.push_back({IROp::Jmp, "", "", "", start}); current_->code.push_back({IROp::Label, "", "", "", end}); }
+    if (auto n = std::get_if<WhileStmt>(&stmt.node)) { auto start = label("while"); auto end = label("endwhile"); current_->code.push_back({IROp::Label, "", "", "", start}); auto c = emit_expr(*n->condition); current_->code.push_back({IROp::Jcc, "z", c, "0", end}); emit_stmt(*n->body); current_->code.push_back({IROp::Jmp, "", "", "", start}); current_->code.push_back({IROp::Label, "", "", "", end}); return; }
+    if (auto n = std::get_if<ForStmt>(&stmt.node)) { auto start = label("for"); auto end = label("endfor"); if (n->init) emit_stmt(*n->init); current_->code.push_back({IROp::Label, "", "", "", start}); if (n->condition) { auto c = emit_expr(*n->condition); current_->code.push_back({IROp::Jcc, "z", c, "0", end}); } emit_stmt(*n->body); if (n->increment) emit_expr(*n->increment); current_->code.push_back({IROp::Jmp, "", "", "", start}); current_->code.push_back({IROp::Label, "", "", "", end}); return; }
+    if (auto n = std::get_if<InlineAsmStmt>(&stmt.node)) { current_->code.push_back({IROp::InlineAsm, "", n->assembly}); return; }
 }
 
 void Optimizer::optimize(IRModule& module) { for (auto& fn : module.functions) { fold_constants(fn); remove_dead_after_ret(fn); simplify_jumps(fn); } }
 void Optimizer::fold_constants(IRFunction& fn) {
     for (auto& i : fn.code) {
-        if ((i.op == IROp::Add || i.op == IROp::Sub || i.op == IROp::Mul || i.op == IROp::Div || i.op == IROp::Mod || i.op == IROp::Cmp) && is_number(i.a) && is_number(i.b)) {
+        if ((i.op == IROp::Add || i.op == IROp::Sub || i.op == IROp::Mul || i.op == IROp::Div || i.op == IROp::Mod || i.op == IROp::And || i.op == IROp::Or || i.op == IROp::Xor || i.op == IROp::Cmp) && is_number(i.a) && is_number(i.b)) {
             auto a = std::stoll(i.a), b = std::stoll(i.b), r = 0LL;
-            if (i.op == IROp::Add) r = a + b; else if (i.op == IROp::Sub) r = a - b; else if (i.op == IROp::Mul) r = a * b; else if (i.op == IROp::Div) r = b ? a / b : 0; else if (i.op == IROp::Mod) r = b ? a % b : 0; else if (i.label == "==") r = a == b; else if (i.label == "!=") r = a != b; else if (i.label == "<") r = a < b; else if (i.label == "<=") r = a <= b; else if (i.label == ">") r = a > b; else if (i.label == ">=") r = a >= b;
+            if (i.op == IROp::Add) r = a + b; else if (i.op == IROp::Sub) r = a - b; else if (i.op == IROp::Mul) r = a * b; else if (i.op == IROp::Div) r = b ? a / b : 0; else if (i.op == IROp::Mod) r = b ? a % b : 0; else if (i.op == IROp::And) r = a & b; else if (i.op == IROp::Or) r = a | b; else if (i.op == IROp::Xor) r = a ^ b; else if (i.label == "==") r = a == b; else if (i.label == "!=") r = a != b; else if (i.label == "<") r = a < b; else if (i.label == "<=") r = a <= b; else if (i.label == ">") r = a > b; else if (i.label == ">=") r = a >= b;
             i.op = IROp::Mov; i.a = std::to_string(r); i.b.clear();
         }
     }
@@ -291,6 +345,9 @@ std::string AsmGenerator486::emit_function(const IRFunction& fn) const {
         case IROp::Add: out << "  mov eax, " << operand(i.a) << "\n  add eax, " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
         case IROp::Sub: out << "  mov eax, " << operand(i.a) << "\n  sub eax, " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
         case IROp::Mul: out << "  mov eax, " << operand(i.a) << "\n  imul eax, " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
+        case IROp::And: out << "  mov eax, " << operand(i.a) << "\n  and eax, " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
+        case IROp::Or: out << "  mov eax, " << operand(i.a) << "\n  or eax, " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
+        case IROp::Xor: out << "  mov eax, " << operand(i.a) << "\n  xor eax, " << operand(i.b) << "\n  mov " << operand(i.dst) << ", eax\n"; break;
         case IROp::Div:
             out << "  mov eax, " << operand(i.a) << "\n  cdq\n";
             if (is_number(i.b)) out << "  mov ecx, " << i.b << "\n  idiv ecx\n"; else out << "  idiv dword " << operand(i.b) << "\n";
@@ -305,6 +362,7 @@ std::string AsmGenerator486::emit_function(const IRFunction& fn) const {
         case IROp::Jmp: out << "  jmp " << i.label << "\n"; break;
         case IROp::Jcc: out << "  cmp " << operand(i.a) << ", " << operand(i.b) << "\n  je " << i.label << "\n"; break;
         case IROp::Call: out << "  call " << i.a << "\n  mov " << operand(i.dst) << ", eax\n"; break;
+        case IROp::InlineAsm: { std::istringstream raw(i.a); std::string raw_line; while (std::getline(raw, raw_line)) if (!trim_copy(raw_line).empty()) out << "  " << trim_copy(raw_line) << "\n"; break; }
         case IROp::Ret: out << "  mov eax, " << operand(i.dst) << "\n  mov esp, ebp\n  pop ebp\n  ret\n"; break;
         default: break;
         }

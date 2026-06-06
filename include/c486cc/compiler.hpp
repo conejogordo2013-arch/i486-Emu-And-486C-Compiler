@@ -18,7 +18,7 @@ public:
 enum class TokenKind {
     End, Identifier, Integer, FloatLiteral, StringLiteral, CharLiteral,
     KwInt, KwChar, KwFloat, KwDouble, KwBool, KwVoid, KwStruct,
-    KwIf, KwElse, KwWhile, KwFor, KwSwitch, KwCase, KwDefault, KwReturn,
+    KwIf, KwElse, KwWhile, KwFor, KwSwitch, KwCase, KwDefault, KwReturn, KwAsm,
     Plus, Minus, Star, Slash, Percent, Amp, Pipe, Caret, Bang, Tilde,
     Assign, Eq, Ne, Lt, Le, Gt, Ge, AndAnd, OrOr,
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
@@ -89,9 +89,10 @@ struct CompoundStmt { std::vector<StmtPtr> statements; };
 struct IfStmt { ExprPtr condition; StmtPtr then_branch; StmtPtr else_branch; };
 struct WhileStmt { ExprPtr condition; StmtPtr body; };
 struct ForStmt { StmtPtr init; ExprPtr condition; ExprPtr increment; StmtPtr body; };
+struct InlineAsmStmt { std::string assembly; };
 
 struct Stmt {
-    std::variant<VarDecl, ReturnStmt, ExprStmt, CompoundStmt, IfStmt, WhileStmt, ForStmt> node;
+    std::variant<VarDecl, ReturnStmt, ExprStmt, CompoundStmt, IfStmt, WhileStmt, ForStmt, InlineAsmStmt> node;
 };
 
 struct Parameter { Type type; std::string name; };
@@ -117,6 +118,11 @@ private:
     VarDecl parse_var_decl_after_type(Type type);
     ExprPtr parse_expression();
     ExprPtr parse_assignment();
+    ExprPtr parse_logical_or();
+    ExprPtr parse_logical_and();
+    ExprPtr parse_bitwise_or();
+    ExprPtr parse_bitwise_xor();
+    ExprPtr parse_bitwise_and();
     ExprPtr parse_equality();
     ExprPtr parse_relational();
     ExprPtr parse_additive();
@@ -125,7 +131,7 @@ private:
     ExprPtr parse_primary();
 };
 
-enum class IROp { Label, Mov, Load, Store, Add, Sub, Mul, Div, Mod, Cmp, Jmp, Jcc, Call, Ret };
+enum class IROp { Label, Mov, Load, Store, Add, Sub, Mul, Div, Mod, And, Or, Xor, Cmp, Jmp, Jcc, Call, Ret, InlineAsm };
 
 struct IRInst {
     IROp op = IROp::Mov;

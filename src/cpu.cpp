@@ -1,5 +1,6 @@
 #include "i486/cpu.hpp"
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 
 namespace i486 {
@@ -31,13 +32,13 @@ std::uint32_t EFlags::pack() const {
     std::uint32_t v = 0x2;
     if (CF) v |= 1u << 0; if (PF) v |= 1u << 2; if (AF) v |= 1u << 4; if (ZF) v |= 1u << 6; if (SF) v |= 1u << 7;
     if (TF) v |= 1u << 8; if (IF) v |= 1u << 9; if (DF) v |= 1u << 10; if (OF) v |= 1u << 11;
-    v |= (IOPL & 3u) << 12; if (NT) v |= 1u << 14; if (RF) v |= 1u << 16; if (VM) v |= 1u << 17; if (AC) v |= 1u << 18;
+    v |= (IOPL & 3u) << 12; if (NT) v |= 1u << 14; if (RF) v |= 1u << 16; if (VM) v |= 1u << 17; if (AC) v |= 1u << 18; if (ID) v |= 1u << 21;
     return v;
 }
 void EFlags::unpack(std::uint32_t v) {
     CF = v & (1u << 0); PF = v & (1u << 2); AF = v & (1u << 4); ZF = v & (1u << 6); SF = v & (1u << 7);
     TF = v & (1u << 8); IF = v & (1u << 9); DF = v & (1u << 10); OF = v & (1u << 11); IOPL = (v >> 12) & 3;
-    NT = v & (1u << 14); RF = v & (1u << 16); VM = v & (1u << 17); AC = v & (1u << 18);
+    NT = v & (1u << 14); RF = v & (1u << 16); VM = v & (1u << 17); AC = v & (1u << 18); ID = v & (1u << 21);
 }
 
 std::uint32_t& Registers::reg32(std::uint8_t i) {
@@ -57,15 +58,23 @@ void Registers::set8(std::uint8_t i, std::uint8_t value) {
 std::uint16_t Registers::get16(std::uint8_t i) const { return static_cast<std::uint16_t>(reg32(i)); }
 void Registers::set16(std::uint8_t i, std::uint16_t value) { auto& r = reg32(i); r = (r & 0xFFFF0000u) | value; }
 
-void FPUx87::fld(double value) { if (stack_.size() >= 8) throw CpuFault("x87 stack overflow"); stack_.insert(stack_.begin(), value); }
-double FPUx87::fst(bool pop) { if (stack_.empty()) throw CpuFault("x87 stack underflow"); const auto v = stack_.front(); if (pop) stack_.erase(stack_.begin()); return v; }
-void FPUx87::fadd() { if (stack_.size() < 2) throw CpuFault("x87 stack underflow"); stack_[1] += stack_[0]; stack_.erase(stack_.begin()); }
-void FPUx87::fmul() { if (stack_.size() < 2) throw CpuFault("x87 stack underflow"); stack_[1] *= stack_[0]; stack_.erase(stack_.begin()); }
-void FPUx87::fdiv() { if (stack_.size() < 2) throw CpuFault("x87 stack underflow"); stack_[1] /= stack_[0]; stack_.erase(stack_.begin()); }
+void FPUx87::refresh_status() {
+    status = static_cast<std::uint16_t>((status & ~0x3800u) | ((stack_.empty() ? 0 : 0) << 11));
+    tag = 0;
+    for (std::size_t i = 0; i < 8; ++i) tag |= static_cast<std::uint16_t>((i < stack_.size() ? 0u : 3u) << (i * 2));
+}
+void FPUx87::fld(double value) { if (stack_.size() >= 8) throw CpuFault("x87 stack overflow"); stack_.insert(stack_.begin(), value); refresh_status(); }
+double FPUx87::fst(bool pop) { if (stack_.empty()) throw CpuFault("x87 stack underflow"); const auto v = stack_.front(); if (pop) stack_.erase(stack_.begin()); refresh_status(); return v; }
+void FPUx87::fadd(std::size_t index, bool pop) { if (index >= stack_.size()) throw CpuFault("x87 stack underflow"); stack_[index] += stack_[0]; if (pop) stack_.erase(stack_.begin()); refresh_status(); }
+void FPUx87::fsub(std::size_t index, bool pop) { if (index >= stack_.size()) throw CpuFault("x87 stack underflow"); stack_[index] -= stack_[0]; if (pop) stack_.erase(stack_.begin()); refresh_status(); }
+void FPUx87::fmul(std::size_t index, bool pop) { if (index >= stack_.size()) throw CpuFault("x87 stack underflow"); stack_[index] *= stack_[0]; if (pop) stack_.erase(stack_.begin()); refresh_status(); }
+void FPUx87::fdiv(std::size_t index, bool pop) { if (index >= stack_.size()) throw CpuFault("x87 stack underflow"); stack_[index] /= stack_[0]; if (pop) stack_.erase(stack_.begin()); refresh_status(); }
+void FPUx87::fsqrt() { if (stack_.empty()) throw CpuFault("x87 stack underflow"); stack_[0] = std::sqrt(stack_[0]); refresh_status(); }
+int FPUx87::fcom(std::size_t index) { if (index >= stack_.size()) throw CpuFault("x87 stack underflow"); status &= ~0x4500u; if (std::isnan(stack_[0]) || std::isnan(stack_[index])) { status |= 0x4500u; return 0; } if (stack_[0] == stack_[index]) { status |= 0x4000u; return 0; } if (stack_[0] < stack_[index]) { status |= 0x0100u; return -1; } return 1; }
 double FPUx87::st(std::size_t index) const { if (index >= stack_.size()) throw CpuFault("x87 stack underflow"); return stack_[index]; }
 
 CPU486::CPU486(Memory& memory, IOBus& io) : memory_(memory), io_(io) { reset(); }
-void CPU486::reset(bool dev_boot) { regs = Registers{}; flags = EFlags{}; halted = false; memory_.mode = CpuMode::Real; regs.cs = dev_boot ? 0 : 0xF000; regs.eip = dev_boot ? 0x7C00 : 0xFFF0; }
+void CPU486::reset(bool dev_boot) { regs = Registers{}; flags = EFlags{}; fpu = FPUx87{}; halted = false; cycles = 0; memory_.mode = CpuMode::Real; memory_.paging_enabled = false; memory_.cpl = 0; memory_.flush_tlb(); regs.cs = dev_boot ? 0 : 0xF000; regs.eip = dev_boot ? 0x7C00 : 0xFFF0; }
 
 std::uint8_t CPU486::fetch8() { auto v = static_cast<std::uint8_t>(memory_.read(regs.cs, regs.eip, 1)); regs.eip++; return v; }
 std::uint16_t CPU486::fetch16() { auto v = static_cast<std::uint16_t>(memory_.read(regs.cs, regs.eip, 2)); regs.eip += 2; return v; }
@@ -112,8 +121,12 @@ std::uint16_t CPU486::read_rm16(const ModRM& m) { return m.mod == 3 ? regs.get16
 void CPU486::write_rm16(const ModRM& m, std::uint16_t v) { if (m.mod == 3) regs.set16(m.rm, v); else memory_.write(data_segment(), effective_address(m), v, 2); }
 std::uint8_t CPU486::read_rm8(const ModRM& m) { return m.mod == 3 ? regs.get8(m.rm) : static_cast<std::uint8_t>(memory_.read(data_segment(), effective_address(m), 1)); }
 void CPU486::write_rm8(const ModRM& m, std::uint8_t v) { if (m.mod == 3) regs.set8(m.rm, v); else memory_.write(data_segment(), effective_address(m), v, 1); }
+void CPU486::push16(std::uint16_t v) { regs.esp -= 2; memory_.write(regs.ss, regs.esp, v, 2); }
+std::uint16_t CPU486::pop16() { auto v = static_cast<std::uint16_t>(memory_.read(regs.ss, regs.esp, 2)); regs.esp += 2; return v; }
 void CPU486::push32(std::uint32_t v) { regs.esp -= 4; memory_.write(regs.ss, regs.esp, v, 4); }
 std::uint32_t CPU486::pop32() { auto v = static_cast<std::uint32_t>(memory_.read(regs.ss, regs.esp, 4)); regs.esp += 4; return v; }
+void CPU486::push(std::uint32_t v) { if (operand32_) push32(v); else push16(static_cast<std::uint16_t>(v)); }
+std::uint32_t CPU486::pop() { return operand32_ ? pop32() : pop16(); }
 void CPU486::rel_jump(std::uint32_t d, std::uint8_t bits) { if (d & (1u << (bits - 1))) d |= ~mask_for(bits); regs.eip += d; }
 
 void CPU486::update_logic_flags(std::uint32_t r, std::uint8_t bits) { r &= mask_for(bits); flags.ZF = r == 0; flags.SF = r & (1u << (bits - 1)); flags.PF = parity8(r); flags.CF = false; flags.OF = false; }
@@ -130,26 +143,32 @@ std::uint32_t CPU486::alu(const std::string& op, std::uint32_t a, std::uint32_t 
 
 std::uint32_t CPU486::step() {
     if (halted) { cycles++; return 1; }
-    service_pending_irq(); operand32_ = true; address32_ = true; has_segment_override_ = false;
-    for (;;) {
-        const auto opcode = fetch8();
-        if (opcode == 0x66) { operand32_ = !operand32_; continue; }
-        if (opcode == 0x67) { address32_ = !address32_; continue; }
-        if (opcode == 0x26 || opcode == 0x2E || opcode == 0x36 || opcode == 0x3E || opcode == 0x64 || opcode == 0x65) {
-            segment_override_ = opcode == 0x26 ? regs.es : opcode == 0x2E ? regs.cs : opcode == 0x36 ? regs.ss : opcode == 0x3E ? regs.ds : opcode == 0x64 ? regs.fs : regs.gs;
-            has_segment_override_ = true; continue;
+    try {
+        service_pending_irq(); operand32_ = true; address32_ = true; has_segment_override_ = false;
+        for (;;) {
+            const auto opcode = fetch8();
+            if (opcode == 0x66) { operand32_ = !operand32_; continue; }
+            if (opcode == 0x67) { address32_ = !address32_; continue; }
+            if (opcode == 0x26 || opcode == 0x2E || opcode == 0x36 || opcode == 0x3E || opcode == 0x64 || opcode == 0x65) {
+                segment_override_ = opcode == 0x26 ? regs.es : opcode == 0x2E ? regs.cs : opcode == 0x36 ? regs.ss : opcode == 0x3E ? regs.ds : opcode == 0x64 ? regs.fs : regs.gs;
+                has_segment_override_ = true; continue;
+            }
+            execute_opcode(opcode); break;
         }
-        execute_opcode(opcode); break;
+    } catch (const PageFault& pf) {
+        regs.cr2 = pf.linear_address;
+        interrupt(14);
     }
     cycles++; return 1;
 }
 
 void CPU486::execute_opcode(std::uint8_t op) {
-    if (op >= 0xB8 && op <= 0xBF) { regs.reg32(op - 0xB8) = fetch_imm(); return; }
-    if (op >= 0x50 && op <= 0x57) { push32(regs.reg32(op - 0x50)); return; }
-    if (op >= 0x58 && op <= 0x5F) { regs.reg32(op - 0x58) = pop32(); return; }
-    if (op >= 0x40 && op <= 0x47) { auto& r = regs.reg32(op - 0x40); r = alu("add", r, 1, 32); return; }
-    if (op >= 0x48 && op <= 0x4F) { auto& r = regs.reg32(op - 0x48); r = alu("sub", r, 1, 32); return; }
+    if (op >= 0xB0 && op <= 0xB7) { regs.set8(op - 0xB0, fetch8()); return; }
+    if (op >= 0xB8 && op <= 0xBF) { if (operand32_) regs.reg32(op - 0xB8) = fetch32(); else regs.set16(op - 0xB8, fetch16()); return; }
+    if (op >= 0x50 && op <= 0x57) { push(regs.reg32(op - 0x50)); return; }
+    if (op >= 0x58 && op <= 0x5F) { const auto v = pop(); if (operand32_) regs.reg32(op - 0x58) = v; else regs.set16(op - 0x58, static_cast<std::uint16_t>(v)); return; }
+    if (op >= 0x40 && op <= 0x47) { if (operand32_) { auto& r = regs.reg32(op - 0x40); r = alu("add", r, 1, 32); } else { regs.set16(op - 0x40, static_cast<std::uint16_t>(alu("add", regs.get16(op - 0x40), 1, 16))); } return; }
+    if (op >= 0x48 && op <= 0x4F) { if (operand32_) { auto& r = regs.reg32(op - 0x48); r = alu("sub", r, 1, 32); } else { regs.set16(op - 0x48, static_cast<std::uint16_t>(alu("sub", regs.get16(op - 0x48), 1, 16))); } return; }
     switch (op) {
     case 0x00: { auto m = fetch_modrm(); write_rm8(m, alu("add", read_rm8(m), regs.get8(m.reg), 8)); break; }
     case 0x01: { auto m = fetch_modrm(); write_rm32(m, alu("add", read_rm32(m), regs.reg32(m.reg), 32)); break; }
@@ -191,8 +210,10 @@ void CPU486::execute_opcode(std::uint8_t op) {
     case 0x85: { auto m = fetch_modrm(); update_logic_flags(read_rm32(m) & regs.reg32(m.reg), 32); flags.CF = flags.OF = false; break; }
     case 0x86: { auto m = fetch_modrm(); auto lhs = read_rm8(m); auto rhs = regs.get8(m.reg); write_rm8(m, rhs); regs.set8(m.reg, lhs); break; }
     case 0x87: { auto m = fetch_modrm(); auto lhs = read_rm32(m); auto rhs = regs.reg32(m.reg); write_rm32(m, rhs); regs.reg32(m.reg) = lhs; break; }
-    case 0x68: push32(fetch_imm()); break;
-    case 0x6A: push32(static_cast<std::uint32_t>(static_cast<std::int8_t>(fetch8()))); break;
+    case 0x60: { const auto old_sp = regs.esp; push(regs.eax); push(regs.ecx); push(regs.edx); push(regs.ebx); push(old_sp); push(regs.ebp); push(regs.esi); push(regs.edi); break; }
+    case 0x61: { regs.edi = pop(); regs.esi = pop(); regs.ebp = pop(); (void)pop(); regs.ebx = pop(); regs.edx = pop(); regs.ecx = pop(); regs.eax = pop(); break; }
+    case 0x68: push(fetch_imm()); break;
+    case 0x6A: push(static_cast<std::uint32_t>(static_cast<std::int8_t>(fetch8()))); break;
     case 0x88: { auto m = fetch_modrm(); write_rm8(m, regs.get8(m.reg)); break; }
     case 0x89: { auto m = fetch_modrm(); write_rm32(m, regs.reg32(m.reg)); break; }
     case 0x8A: { auto m = fetch_modrm(); regs.set8(m.reg, read_rm8(m)); break; }
@@ -201,21 +222,27 @@ void CPU486::execute_opcode(std::uint8_t op) {
     case 0x90: break;
     case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: { auto& r = regs.reg32(op - 0x90); std::swap(regs.eax, r); break; }
     case 0x99: regs.edx = (regs.eax & 0x80000000u) ? 0xFFFFFFFFu : 0; break;
-    case 0x9C: push32(flags.pack()); break; case 0x9D: flags.unpack(pop32()); break;
+    case 0x9C: push(flags.pack()); break; case 0x9D: flags.unpack(pop()); break;
     case 0xA8: update_logic_flags(regs.get8(0) & fetch8(), 8); flags.CF = flags.OF = false; break;
     case 0xA9: update_logic_flags(regs.eax & fetch_imm(), 32); flags.CF = flags.OF = false; break;
     case 0xA0: regs.set8(0, memory_.read(data_segment(), fetch32(), 1)); break;
     case 0xA1: regs.eax = static_cast<std::uint32_t>(memory_.read(data_segment(), fetch32(), 4)); break;
     case 0xA2: memory_.write(data_segment(), fetch32(), regs.get8(0), 1); break;
     case 0xA3: memory_.write(data_segment(), fetch32(), regs.eax, 4); break;
-    case 0xC3: regs.eip = pop32(); break;
-    case 0xC9: regs.esp = regs.ebp; regs.ebp = pop32(); break;
+    case 0xC2: { const auto bytes = fetch16(); regs.eip = pop(); regs.esp += bytes; break; }
+    case 0xC3: regs.eip = pop(); break;
+    case 0xC8: { const auto frame = fetch16(); const auto nesting = fetch8() & 31u; push(regs.ebp); const auto frame_temp = regs.esp; for (std::uint8_t i = 1; i < nesting; ++i) { regs.ebp -= operand32_ ? 4 : 2; push(memory_.read(regs.ss, regs.ebp, operand32_ ? 4 : 2)); } if (nesting) push(frame_temp); regs.ebp = frame_temp; regs.esp -= frame; break; }
+    case 0xC9: regs.esp = regs.ebp; regs.ebp = pop(); break;
     case 0xC6: { auto m = fetch_modrm(); if (m.reg != 0) throw CpuFault("bad C6 group"); write_rm8(m, fetch8()); break; }
     case 0xC7: { auto m = fetch_modrm(); if (m.reg != 0) throw CpuFault("bad C7 group"); write_rm32(m, fetch_imm()); break; }
     case 0xD0: case 0xD1: case 0xD2: case 0xD3: execute_group2(op); break;
     case 0xCD: interrupt(fetch8()); break; case 0xCF: iret(); break;
-    case 0xE8: { auto ret = regs.eip + 4; auto d = fetch32(); push32(ret); rel_jump(d, 32); break; }
-    case 0xE9: rel_jump(fetch32(), 32); break; case 0xEB: rel_jump(fetch8(), 8); break;
+    case 0xE8: { auto ret = regs.eip + (operand32_ ? 4 : 2); auto d = fetch_imm(); push(ret); rel_jump(d, operand32_ ? 32 : 16); break; }
+    case 0xE9: rel_jump(fetch_imm(), operand32_ ? 32 : 16); break; case 0xEB: rel_jump(fetch8(), 8); break;
+    case 0xE0: { const auto d = fetch8(); regs.ecx--; if (regs.ecx != 0 && !flags.ZF) rel_jump(d, 8); break; }
+    case 0xE1: { const auto d = fetch8(); regs.ecx--; if (regs.ecx != 0 && flags.ZF) rel_jump(d, 8); break; }
+    case 0xE2: { const auto d = fetch8(); regs.ecx--; if (regs.ecx != 0) rel_jump(d, 8); break; }
+    case 0xE3: { const auto d = fetch8(); if (regs.ecx == 0) rel_jump(d, 8); break; }
     case 0xE4: regs.set8(0, io_.in_port(fetch8(), 1)); break; case 0xE5: regs.eax = io_.in_port(fetch8(), 4); break;
     case 0xE6: io_.out_port(fetch8(), regs.get8(0), 1); break; case 0xE7: io_.out_port(fetch8(), regs.eax, 4); break;
     case 0xEC: regs.set8(0, io_.in_port(static_cast<std::uint16_t>(regs.edx), 1)); break; case 0xED: regs.eax = io_.in_port(static_cast<std::uint16_t>(regs.edx), 4); break;
@@ -223,7 +250,7 @@ void CPU486::execute_opcode(std::uint8_t op) {
     case 0xF4: halted = true; break; case 0xFA: flags.IF = false; break; case 0xFB: flags.IF = true; break;
     case 0xF6: case 0xF7: execute_group3(op); break;
     case 0x0F: execute_extended(); break; case 0x80: case 0x81: case 0x83: execute_group1(op); break;
-    case 0xD9: case 0xDE: execute_fpu(op); break;
+    case 0xD9: case 0xDD: case 0xDE: execute_fpu(op); break;
     default:
         if (op >= 0x70 && op <= 0x7F) { const auto d = fetch8(); if (condition(op & 0x0F)) rel_jump(d, 8); break; }
         throw CpuFault("unimplemented opcode 0x" + std::to_string(op));
@@ -290,22 +317,92 @@ void CPU486::execute_extended() {
         return;
     }
     if (op >= 0x90 && op <= 0x9F) { auto m = fetch_modrm(); write_rm8(m, condition(op & 0x0F) ? 1 : 0); return; }
+    if (op == 0x01) {
+        auto m = fetch_modrm();
+        switch (m.reg) {
+        case 0: store_table_register(tables.gdtr, m); memory_.gdtr = tables.gdtr; return;
+        case 1: store_table_register(tables.idtr, m); memory_.idtr = tables.idtr; return;
+        case 2: load_table_register(tables.gdtr, m); memory_.gdtr = tables.gdtr; return;
+        case 3: load_table_register(tables.idtr, m); memory_.idtr = tables.idtr; return;
+        case 4: write_rm16(m, static_cast<std::uint16_t>(regs.cr0)); return; // SMSW
+        case 6: regs.cr0 = (regs.cr0 & 0xFFFF0000u) | read_rm16(m); memory_.mode = (regs.cr0 & 1) ? CpuMode::Protected : CpuMode::Real; return; // LMSW
+        case 7: memory_.invalidate_tlb(effective_address(m)); return; // INVLPG
+        default: throw CpuFault("unsupported 0F 01 group");
+        }
+    }
+    if (op == 0x02) { auto m = fetch_modrm(); regs.reg32(m.reg) = tables.ldtr.base; return; } // LAR-compatible placeholder
+    if (op == 0x06) { throw CpuFault("CLTS is privileged and not wired yet"); }
+    if (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB) {
+        auto m = fetch_modrm();
+        const auto bit = regs.reg32(m.reg) & 31u;
+        auto value = read_rm32(m);
+        flags.CF = (value >> bit) & 1u;
+        if (op == 0xAB) value |= (1u << bit);
+        else if (op == 0xB3) value &= ~(1u << bit);
+        else if (op == 0xBB) value ^= (1u << bit);
+        if (op != 0xA3) write_rm32(m, value);
+        return;
+    }
+    if (op == 0xA4 || op == 0xAC) { auto m = fetch_modrm(); const auto imm = fetch8() & 31u; if (imm == 0) return; auto dst = read_rm32(m); const auto src = regs.reg32(m.reg); const auto result = op == 0xA4 ? ((dst << imm) | (src >> (32 - imm))) : ((dst >> imm) | (src << (32 - imm))); write_rm32(m, result); update_logic_flags(result, 32); return; }
+    if (op == 0xA5 || op == 0xAD) { auto m = fetch_modrm(); const auto imm = regs.get8(1) & 31u; if (imm == 0) return; auto dst = read_rm32(m); const auto src = regs.reg32(m.reg); const auto result = op == 0xA5 ? ((dst << imm) | (src >> (32 - imm))) : ((dst >> imm) | (src << (32 - imm))); write_rm32(m, result); update_logic_flags(result, 32); return; }
+    if (op == 0xA2) { regs.eax = 0; regs.ebx = 0x34383669u; regs.edx = 0x20434F44u; regs.ecx = 0x00555043u; flags.ID = true; return; }
     if (op == 0xAF) { auto m = fetch_modrm(); regs.reg32(m.reg) = static_cast<std::uint32_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(regs.reg32(m.reg))) * static_cast<std::int32_t>(read_rm32(m))); update_logic_flags(regs.reg32(m.reg), 32); return; }
+    if (op == 0xB0 || op == 0xB1) { auto m = fetch_modrm(); if (op == 0xB0) { const auto old = read_rm8(m); flags.ZF = old == regs.get8(0); if (flags.ZF) write_rm8(m, regs.get8(m.reg)); else regs.set8(0, old); } else { const auto old = read_rm32(m); flags.ZF = old == regs.eax; if (flags.ZF) write_rm32(m, regs.reg32(m.reg)); else regs.eax = old; } return; }
+    if (op == 0xC0 || op == 0xC1) { auto m = fetch_modrm(); if (op == 0xC0) { const auto old = read_rm8(m); const auto src = regs.get8(m.reg); const auto result = static_cast<std::uint8_t>(old + src); write_rm8(m, result); regs.set8(m.reg, old); update_logic_flags(result, 8); } else { const auto old = read_rm32(m); const auto src = regs.reg32(m.reg); const auto result = old + src; write_rm32(m, result); regs.reg32(m.reg) = old; update_logic_flags(result, 32); } return; }
     if (op == 0xB6) { auto m = fetch_modrm(); regs.reg32(m.reg) = read_rm8(m); return; }
     if (op == 0xBE) { auto m = fetch_modrm(); regs.reg32(m.reg) = sign_extend(read_rm8(m), 8); return; }
     if (op == 0xB7) { auto m = fetch_modrm(); regs.reg32(m.reg) = read_rm16(m); return; }
     if (op == 0xBF) { auto m = fetch_modrm(); regs.reg32(m.reg) = sign_extend(read_rm16(m), 16); return; }
     if (op >= 0xC8 && op <= 0xCF) { auto& r = regs.reg32(op - 0xC8); r = ((r & 0x000000FFu) << 24) | ((r & 0x0000FF00u) << 8) | ((r & 0x00FF0000u) >> 8) | ((r & 0xFF000000u) >> 24); return; }
     if (op == 0x20) { auto m = fetch_modrm(); regs.reg32(m.rm) = m.reg == 0 ? regs.cr0 : m.reg == 2 ? regs.cr2 : m.reg == 3 ? regs.cr3 : regs.cr4; return; }
-    if (op == 0x22) { auto m = fetch_modrm(); auto value = regs.reg32(m.rm); if (m.reg == 0) { regs.cr0 = value; memory_.mode = (regs.cr0 & 1) ? CpuMode::Protected : CpuMode::Real; memory_.paging_enabled = regs.cr0 & 0x80000000u; } else if (m.reg == 2) regs.cr2 = value; else if (m.reg == 3) regs.cr3 = value; else regs.cr4 = value; return; }
+    if (op == 0x22) { auto m = fetch_modrm(); auto value = regs.reg32(m.rm); if (m.reg == 0) { regs.cr0 = value; memory_.mode = (regs.cr0 & 1) ? CpuMode::Protected : CpuMode::Real; memory_.paging_enabled = regs.cr0 & 0x80000000u; memory_.flush_tlb(); } else if (m.reg == 2) regs.cr2 = value; else if (m.reg == 3) { regs.cr3 = value; memory_.flush_tlb(); } else regs.cr4 = value; return; }
     throw CpuFault("unimplemented 0F opcode");
 }
 
 void CPU486::execute_fpu(std::uint8_t op) {
     const auto sub = fetch8();
-    if (op == 0xD9 && sub == 0xE8) fpu.fld(1.0); else if (op == 0xD9 && sub == 0xEE) fpu.fld(0.0);
-    else if (op == 0xDE && sub == 0xC1) fpu.fadd(); else if (op == 0xDE && sub == 0xC9) fpu.fmul(); else if (op == 0xDE && sub == 0xF9) fpu.fdiv();
-    else throw CpuFault("unimplemented x87 opcode");
+    if (op == 0xD9 && sub == 0xE8) { fpu.fld(1.0); return; }
+    if (op == 0xD9 && sub == 0xEE) { fpu.fld(0.0); return; }
+    if (op == 0xD9 && sub == 0xFA) { fpu.fsqrt(); return; }
+    if (op == 0xD9 && sub >= 0xC0 && sub <= 0xC7) { fpu.fld(fpu.st(sub & 7)); return; }
+    if (op == 0xD9 && sub >= 0xD0 && sub <= 0xD7) { fpu.fcom(sub & 7); return; }
+    if (op == 0xD9 && sub < 0xC0) {
+        regs.eip--;
+        auto m = fetch_modrm();
+        if (m.reg == 0) { const auto raw = static_cast<std::uint32_t>(memory_.read(data_segment(), effective_address(m), 4)); float v; std::memcpy(&v, &raw, sizeof(v)); fpu.fld(v); return; }
+        if (m.reg == 2 || m.reg == 3) { const float v = static_cast<float>(fpu.fst(m.reg == 3)); std::uint32_t raw; std::memcpy(&raw, &v, sizeof(raw)); memory_.write(data_segment(), effective_address(m), raw, 4); return; }
+    }
+    if (op == 0xDD && sub < 0xC0) {
+        regs.eip--;
+        auto m = fetch_modrm();
+        if (m.reg == 0) { const auto raw = memory_.read(data_segment(), effective_address(m), 8); double v; std::memcpy(&v, &raw, sizeof(v)); fpu.fld(v); return; }
+        if (m.reg == 2 || m.reg == 3) { const double v = fpu.fst(m.reg == 3); std::uint64_t raw; std::memcpy(&raw, &v, sizeof(raw)); memory_.write(data_segment(), effective_address(m), raw, 8); return; }
+    }
+    if (op == 0xDE && sub == 0xC1) { fpu.fadd(); return; }
+    if (op == 0xDE && sub == 0xE9) { fpu.fsub(); return; }
+    if (op == 0xDE && sub == 0xC9) { fpu.fmul(); return; }
+    if (op == 0xDE && sub == 0xF9) { fpu.fdiv(); return; }
+    throw CpuFault("unimplemented x87 opcode");
+}
+
+
+void CPU486::load_table_register(DescriptorTableRegister& reg, const ModRM& m) {
+    if (!m.has_memory) throw CpuFault("descriptor table load requires memory operand");
+    const auto addr = effective_address(m);
+    reg.limit = static_cast<std::uint16_t>(memory_.read(data_segment(), addr, 2));
+    reg.base = static_cast<std::uint32_t>(memory_.read(data_segment(), addr + 2, operand32_ ? 4 : 3));
+}
+
+void CPU486::store_table_register(const DescriptorTableRegister& reg, const ModRM& m) {
+    if (!m.has_memory) throw CpuFault("descriptor table store requires memory operand");
+    const auto addr = effective_address(m);
+    memory_.write(data_segment(), addr, reg.limit, 2);
+    memory_.write(data_segment(), addr + 2, reg.base, operand32_ ? 4 : 3);
+}
+
+void CPU486::raise_fault(std::uint8_t vector, std::uint32_t error_code) {
+    if (vector == 14) regs.cr2 = error_code;
+    interrupt(vector);
 }
 
 bool CPU486::condition(std::uint8_t jcc) const {

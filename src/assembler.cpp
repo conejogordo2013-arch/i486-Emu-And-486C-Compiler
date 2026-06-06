@@ -45,32 +45,38 @@ int reg8_id(const std::string& r) {
     return -1;
 }
 void emit8(std::vector<std::uint8_t>& out, std::uint8_t v) { out.push_back(v); }
+void emit16(std::vector<std::uint8_t>& out, std::uint16_t v) { emit8(out, v); emit8(out, v >> 8); }
 void emit32(std::vector<std::uint8_t>& out, std::uint32_t v) { for (int i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>((v >> (i * 8)) & 0xFF)); }
-struct MemOp { bool valid = false; int base = -1; std::int32_t disp = 0; bool absolute = false; };
+struct MemOp { bool valid = false; int base = -1; int index = -1; int scale = 1; std::int32_t disp = 0; bool absolute = false; };
 MemOp parse_mem(std::string op) {
     op = lower_copy(trim_copy(op));
     if (op.rfind("dword", 0) == 0) op = trim_copy(op.substr(5));
+    if (op.rfind("byte", 0) == 0) op = trim_copy(op.substr(4));
     if (op.size() < 3 || op.front() != '[' || op.back() != ']') return {};
     auto inner = trim_copy(op.substr(1, op.size() - 2));
-    std::int64_t imm = 0; if (parse_int_token(inner, imm)) return {true, -1, static_cast<std::int32_t>(imm), true};
+    std::int64_t imm = 0; if (parse_int_token(inner, imm)) return {true, -1, -1, 1, static_cast<std::int32_t>(imm), true};
     for (int r = 0; r < 8; ++r) {
         const char* names[] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi"};
         std::string name = names[r];
-        if (inner == name) return {true, r, 0, false};
+        if (inner == name) return {true, r, -1, 1, 0, false};
         if (inner.rfind(name + "+", 0) == 0 || inner.rfind(name + "-", 0) == 0) {
             const bool neg = inner[name.size()] == '-';
-            std::int64_t d = 0; if (parse_int_token(inner.substr(name.size() + 1), d)) return {true, r, static_cast<std::int32_t>(neg ? -d : d), false};
+            std::int64_t d = 0; if (parse_int_token(inner.substr(name.size() + 1), d)) return {true, r, -1, 1, static_cast<std::int32_t>(neg ? -d : d), false};
         }
     }
     return {};
 }
 void emit_modrm_mem(std::vector<std::uint8_t>& out, std::uint8_t reg, const MemOp& m) {
     if (m.absolute) { emit8(out, static_cast<std::uint8_t>((0 << 6) | ((reg & 7) << 3) | 5)); emit32(out, m.disp); return; }
-    if (m.base == 4) throw CompileError("assembler MVP: [esp] requires SIB and is not emitted yet");
     const bool disp8 = m.disp >= -128 && m.disp <= 127;
     const bool need_disp = m.disp != 0 || m.base == 5;
     const std::uint8_t mod = !need_disp ? 0 : (disp8 ? 1 : 2);
-    emit8(out, static_cast<std::uint8_t>((mod << 6) | ((reg & 7) << 3) | (m.base & 7)));
+    if (m.base == 4) {
+        emit8(out, static_cast<std::uint8_t>((mod << 6) | ((reg & 7) << 3) | 4));
+        emit8(out, static_cast<std::uint8_t>((0 << 6) | (4 << 3) | 4));
+    } else {
+        emit8(out, static_cast<std::uint8_t>((mod << 6) | ((reg & 7) << 3) | (m.base & 7)));
+    }
     if (need_disp) { if (disp8) emit8(out, static_cast<std::uint8_t>(m.disp)); else emit32(out, m.disp); }
 }
 void emit_modrm_reg(std::vector<std::uint8_t>& out, std::uint8_t reg, std::uint8_t rm) { emit8(out, static_cast<std::uint8_t>(0xC0 | ((reg & 7) << 3) | (rm & 7))); }
@@ -91,34 +97,51 @@ ObjectFile Assembler486::assemble(const std::string& source) const {
         auto space = line.find_first_of(" \t"); auto mnemonic = lower_copy(space == std::string::npos ? line : line.substr(0, space)); auto ops = split_operands(space == std::string::npos ? "" : line.substr(space + 1));
         if (mnemonic == "bits" || mnemonic == "section") continue;
         if (mnemonic == "global") { if (!ops.empty()) globals.insert(ops[0]); continue; }
-        if (mnemonic == "db" || mnemonic == "dw" || mnemonic == "dd") { for (auto& op : ops) { std::int64_t v = 0; if (!parse_int_token(op, v)) throw CompileError("data directive expects integer"); if (mnemonic == "db") emit8(code, v); else if (mnemonic == "dw") { emit8(code, v); emit8(code, v >> 8); } else emit32(code, v); } continue; }
-        if (mnemonic == "ret") { emit8(code, 0xC3); continue; } if (mnemonic == "hlt") { emit8(code, 0xF4); continue; } if (mnemonic == "nop") { emit8(code, 0x90); continue; } if (mnemonic == "cdq") { emit8(code, 0x99); continue; }
+        if (mnemonic == "align" && ops.size() == 1) { std::int64_t n = 0; if (!parse_int_token(ops[0], n) || n <= 0) throw CompileError("align expects positive integer"); while (code.size() % static_cast<std::size_t>(n)) emit8(code, 0); continue; }
+        if (mnemonic == "org" && ops.size() == 1) { std::int64_t n = 0; if (!parse_int_token(ops[0], n) || n < static_cast<std::int64_t>(code.size())) throw CompileError("org expects forward absolute offset"); while (code.size() < static_cast<std::size_t>(n)) emit8(code, 0); continue; }
+        if (mnemonic == "db" || mnemonic == "dw" || mnemonic == "dd") { for (auto& op : ops) { auto t = trim_copy(op); if (mnemonic == "db" && t.size() >= 2 && t.front() == '"' && t.back() == '"') { for (std::size_t i = 1; i + 1 < t.size(); ++i) emit8(code, static_cast<std::uint8_t>(t[i])); continue; } std::int64_t v = 0; if (!parse_int_token(t, v)) throw CompileError("data directive expects integer or db string"); if (mnemonic == "db") emit8(code, v); else if (mnemonic == "dw") emit16(code, v); else emit32(code, v); } continue; }
+        if (mnemonic == "ret") { if (ops.empty()) emit8(code, 0xC3); else { std::int64_t v=0; if (!parse_int_token(ops[0], v)) throw CompileError("ret imm16 expects integer"); emit8(code,0xC2); emit16(code,v); } continue; } if (mnemonic == "hlt") { emit8(code, 0xF4); continue; } if (mnemonic == "nop") { emit8(code, 0x90); continue; } if (mnemonic == "cdq") { emit8(code, 0x99); continue; } if (mnemonic == "cli") { emit8(code,0xFA); continue; } if (mnemonic == "sti") { emit8(code,0xFB); continue; } if (mnemonic == "iret") { emit8(code,0xCF); continue; } if (mnemonic == "cpuid") { emit8(code,0x0F); emit8(code,0xA2); continue; }
         if (mnemonic == "int" && ops.size() == 1) { std::int64_t v=0; if (!parse_int_token(ops[0], v)) throw CompileError("int expects immediate"); emit8(code, 0xCD); emit8(code, v); continue; }
-        if ((mnemonic == "jmp" || mnemonic == "je" || mnemonic == "jne" || mnemonic == "call") && ops.size() == 1) { if (mnemonic == "call") emit8(code, 0xE8); else if (mnemonic == "jmp") emit8(code, 0xE9); else { emit8(code, 0x0F); emit8(code, mnemonic == "je" ? 0x84 : 0x85); } pending.push_back({static_cast<std::uint32_t>(code.size()), ops[0], true}); emit32(code, 0); continue; }
+        if ((mnemonic == "jmp" || mnemonic == "call" || (mnemonic.size() >= 2 && mnemonic[0] == 'j')) && ops.size() == 1) { static const std::unordered_map<std::string,std::uint8_t> jcc{{"jo",0x80},{"jno",0x81},{"jb",0x82},{"jc",0x82},{"jnae",0x82},{"jae",0x83},{"jnb",0x83},{"jnc",0x83},{"je",0x84},{"jz",0x84},{"jne",0x85},{"jnz",0x85},{"jbe",0x86},{"jna",0x86},{"ja",0x87},{"jnbe",0x87},{"js",0x88},{"jns",0x89},{"jp",0x8A},{"jpe",0x8A},{"jnp",0x8B},{"jpo",0x8B},{"jl",0x8C},{"jnge",0x8C},{"jge",0x8D},{"jnl",0x8D},{"jle",0x8E},{"jng",0x8E},{"jg",0x8F},{"jnle",0x8F}}; if (mnemonic == "call") emit8(code, 0xE8); else if (mnemonic == "jmp") emit8(code, 0xE9); else { auto it = jcc.find(mnemonic); if (it == jcc.end()) throw CompileError("unsupported jcc"); emit8(code, 0x0F); emit8(code, it->second); } pending.push_back({static_cast<std::uint32_t>(code.size()), ops[0], true}); emit32(code, 0); continue; }
         if (mnemonic == "push" && ops.size() == 1) { auto op=strip_size(ops[0]); int r=reg32_id(op); std::int64_t imm=0; if (r>=0) emit8(code, 0x50+r); else if (parse_int_token(op,imm)) { emit8(code,0x68); emit32(code,imm); } else throw CompileError("unsupported push operand"); continue; }
         if (mnemonic == "pop" && ops.size() == 1) { int r=reg32_id(ops[0]); if (r<0) throw CompileError("pop expects r32"); emit8(code,0x58+r); continue; }
         if (ops.size() == 2 && mnemonic == "mov") {
             auto dst = strip_size(ops[0]), src = strip_size(ops[1]); int rd = reg32_id(dst), rs = reg32_id(src); std::int64_t imm = 0; auto md = parse_mem(dst), ms = parse_mem(src);
+            const bool byte_dst = lower_copy(ops[0]).rfind("byte", 0) == 0; const bool byte_src = lower_copy(ops[1]).rfind("byte", 0) == 0;
+            int r8d = reg8_id(dst), r8s = reg8_id(src);
+            if (r8d >= 0 && parse_int_token(src, imm)) { emit8(code, 0xB0 + r8d); emit8(code, imm); continue; }
+            if (r8d >= 0 && r8s >= 0) { emit8(code, 0x88); emit_modrm_reg(code, r8s, r8d); continue; }
+            if (r8d >= 0 && ms.valid) { emit8(code, 0x8A); emit_modrm_mem(code, r8d, ms); continue; }
+            if (md.valid && r8s >= 0) { emit8(code, 0x88); emit_modrm_mem(code, r8s, md); continue; }
+            if ((byte_dst || md.valid) && md.valid && parse_int_token(src, imm) && (byte_dst || byte_src)) { emit8(code, 0xC6); emit_modrm_mem(code, 0, md); emit8(code, imm); continue; }
             if (rd >= 0 && parse_int_token(src, imm)) { emit8(code, 0xB8 + rd); emit32(code, imm); continue; }
             if (rd >= 0 && rs >= 0) { emit8(code, 0x89); emit_modrm_reg(code, rs, rd); continue; }
             if (rd >= 0 && ms.valid) { emit8(code, 0x8B); emit_modrm_mem(code, rd, ms); continue; }
             if (md.valid && rs >= 0) { emit8(code, 0x89); emit_modrm_mem(code, rs, md); continue; }
             if (md.valid && parse_int_token(src, imm)) { emit8(code, 0xC7); emit_modrm_mem(code, 0, md); emit32(code, imm); continue; }
         }
-        if (ops.size() == 2 && (mnemonic == "add" || mnemonic == "sub" || mnemonic == "cmp")) {
+        if (ops.size() == 2 && (mnemonic == "add" || mnemonic == "sub" || mnemonic == "cmp" || mnemonic == "and" || mnemonic == "or" || mnemonic == "xor")) {
             auto dst=strip_size(ops[0]), src=strip_size(ops[1]); int rd=reg32_id(dst), rs=reg32_id(src); auto md=parse_mem(dst), ms=parse_mem(src); std::int64_t imm=0;
-            const std::uint8_t ext = mnemonic == "add" ? 0 : mnemonic == "sub" ? 5 : 7;
-            if (rd == 0 && parse_int_token(src, imm) && mnemonic != "cmp") { emit8(code, mnemonic == "add" ? 0x05 : 0x2D); emit32(code, imm); continue; }
+            const std::uint8_t ext = mnemonic == "add" ? 0 : mnemonic == "or" ? 1 : mnemonic == "and" ? 4 : mnemonic == "sub" ? 5 : mnemonic == "xor" ? 6 : 7;
+            if (rd == 0 && parse_int_token(src, imm) && mnemonic != "cmp") { emit8(code, mnemonic == "add" ? 0x05 : mnemonic == "or" ? 0x0D : mnemonic == "and" ? 0x25 : mnemonic == "sub" ? 0x2D : 0x35); emit32(code, imm); continue; }
             if (rd >= 0 && parse_int_token(src, imm)) { emit8(code, 0x81); emit_modrm_reg(code, ext, rd); emit32(code, imm); continue; }
             if (md.valid && parse_int_token(src, imm)) { emit8(code, 0x81); emit_modrm_mem(code, ext, md); emit32(code, imm); continue; }
-            if (rd >= 0 && rs >= 0) { emit8(code, mnemonic == "add" ? 0x01 : mnemonic == "sub" ? 0x29 : 0x39); emit_modrm_reg(code, rs, rd); continue; }
-            if (rd >= 0 && ms.valid) { emit8(code, mnemonic == "add" ? 0x03 : mnemonic == "sub" ? 0x2B : 0x3B); emit_modrm_mem(code, rd, ms); continue; }
-            if (md.valid && rs >= 0) { emit8(code, mnemonic == "add" ? 0x01 : mnemonic == "sub" ? 0x29 : 0x39); emit_modrm_mem(code, rs, md); continue; }
+            if (rd >= 0 && rs >= 0) { emit8(code, mnemonic == "add" ? 0x01 : mnemonic == "or" ? 0x09 : mnemonic == "and" ? 0x21 : mnemonic == "sub" ? 0x29 : mnemonic == "xor" ? 0x31 : 0x39); emit_modrm_reg(code, rs, rd); continue; }
+            if (rd >= 0 && ms.valid) { emit8(code, mnemonic == "add" ? 0x03 : mnemonic == "or" ? 0x0B : mnemonic == "and" ? 0x23 : mnemonic == "sub" ? 0x2B : mnemonic == "xor" ? 0x33 : 0x3B); emit_modrm_mem(code, rd, ms); continue; }
+            if (md.valid && rs >= 0) { emit8(code, mnemonic == "add" ? 0x01 : mnemonic == "or" ? 0x09 : mnemonic == "and" ? 0x21 : mnemonic == "sub" ? 0x29 : mnemonic == "xor" ? 0x31 : 0x39); emit_modrm_mem(code, rs, md); continue; }
         }
         if (ops.size() == 2 && mnemonic == "imul") { int rd=reg32_id(ops[0]); int rs=reg32_id(strip_size(ops[1])); auto ms=parse_mem(ops[1]); if (rd<0) throw CompileError("imul dst must be r32"); emit8(code,0x0F); emit8(code,0xAF); if (rs>=0) emit_modrm_reg(code, rd, rs); else if (ms.valid) emit_modrm_mem(code, rd, ms); else throw CompileError("unsupported imul source"); continue; }
         if (ops.size() == 1 && mnemonic == "idiv") { auto op=strip_size(ops[0]); int r=reg32_id(op); auto m=parse_mem(op); emit8(code,0xF7); if (r>=0) emit_modrm_reg(code,7,r); else if (m.valid) emit_modrm_mem(code,7,m); else throw CompileError("idiv expects r/m32"); continue; }
         if (ops.size() == 1 && mnemonic.rfind("set",0)==0) { int r=reg8_id(ops[0]); if (r<0) throw CompileError("setcc expects r8"); static const std::unordered_map<std::string,std::uint8_t> cc{{"sete",0x94},{"setz",0x94},{"setne",0x95},{"setnz",0x95},{"setl",0x9C},{"setle",0x9E},{"setg",0x9F},{"setge",0x9D}}; auto it=cc.find(mnemonic); if (it==cc.end()) throw CompileError("unsupported setcc"); emit8(code,0x0F); emit8(code,it->second); emit_modrm_reg(code,0,r); continue; }
         if (ops.size() == 2 && mnemonic == "movzx") { int rd=reg32_id(ops[0]); int rs=reg8_id(ops[1]); if (rd<0 || rs<0) throw CompileError("movzx supports r32,r8"); emit8(code,0x0F); emit8(code,0xB6); emit_modrm_reg(code,rd,rs); continue; }
+        if (ops.size() == 2 && mnemonic == "test") { auto dst=strip_size(ops[0]), src=strip_size(ops[1]); int rd=reg32_id(dst), rs=reg32_id(src); auto md=parse_mem(dst); std::int64_t imm=0; if (rd>=0 && rs>=0) { emit8(code,0x85); emit_modrm_reg(code,rs,rd); continue; } if (rd>=0 && parse_int_token(src,imm)) { emit8(code,0xF7); emit_modrm_reg(code,0,rd); emit32(code,imm); continue; } if (md.valid && rs>=0) { emit8(code,0x85); emit_modrm_mem(code,rs,md); continue; } }
+        if (ops.size() == 2 && mnemonic == "xchg") { int rd=reg32_id(ops[0]), rs=reg32_id(ops[1]); if (rd>=0 && rs>=0) { emit8(code,0x87); emit_modrm_reg(code,rs,rd); continue; } }
+        if (ops.size() == 1 && (mnemonic == "neg" || mnemonic == "not" || mnemonic == "mul" || mnemonic == "div")) { auto op=strip_size(ops[0]); int r=reg32_id(op); auto m=parse_mem(op); const std::uint8_t ext = mnemonic == "not" ? 2 : mnemonic == "neg" ? 3 : mnemonic == "mul" ? 4 : 6; emit8(code,0xF7); if (r>=0) emit_modrm_reg(code,ext,r); else if (m.valid) emit_modrm_mem(code,ext,m); else throw CompileError("group3 expects r/m32"); continue; }
+        if (ops.size() == 2 && (mnemonic == "shl" || mnemonic == "sal" || mnemonic == "shr" || mnemonic == "sar" || mnemonic == "rol" || mnemonic == "ror")) { auto dst=strip_size(ops[0]); int r=reg32_id(dst); auto m=parse_mem(dst); std::int64_t imm=0; const std::uint8_t ext = (mnemonic == "rol") ? 0 : (mnemonic == "ror") ? 1 : (mnemonic == "shr") ? 5 : (mnemonic == "sar") ? 7 : 4; if (!parse_int_token(ops[1], imm) || imm != 1) throw CompileError("shift MVP supports count 1"); emit8(code,0xD1); if (r>=0) emit_modrm_reg(code,ext,r); else if (m.valid) emit_modrm_mem(code,ext,m); else throw CompileError("shift expects r/m32"); continue; }
+        if (ops.size() == 1 && mnemonic == "bswap") { int r=reg32_id(ops[0]); if (r<0) throw CompileError("bswap expects r32"); emit8(code,0x0F); emit8(code,0xC8+r); continue; }
+        if (ops.size() == 2 && (mnemonic == "cmpxchg" || mnemonic == "xadd" || mnemonic == "bt" || mnemonic == "bts" || mnemonic == "btr" || mnemonic == "btc")) { auto dst=strip_size(ops[0]), src=strip_size(ops[1]); int rs=reg32_id(src); auto md=parse_mem(dst); int rd=reg32_id(dst); if (rs<0) throw CompileError("i486 op source must be r32"); static const std::unordered_map<std::string,std::uint8_t> opcodes{{"bt",0xA3},{"bts",0xAB},{"btr",0xB3},{"btc",0xBB},{"cmpxchg",0xB1},{"xadd",0xC1}}; emit8(code,0x0F); emit8(code,opcodes.at(mnemonic)); if (rd>=0) emit_modrm_reg(code,rs,rd); else if (md.valid) emit_modrm_mem(code,rs,md); else throw CompileError("i486 op expects r/m32 dst"); continue; }
+        if (mnemonic == "out" && ops.size() == 2) { std::int64_t port=0; auto src=lower_copy(strip_size(ops[1])); if (parse_int_token(ops[0], port) && src == "al") { emit8(code,0xE6); emit8(code,port); continue; } if (lower_copy(ops[0]) == "dx" && src == "al") { emit8(code,0xEE); continue; } if (lower_copy(ops[0]) == "dx" && src == "eax") { emit8(code,0xEF); continue; } }
+        if (mnemonic == "in" && ops.size() == 2) { auto dst=lower_copy(strip_size(ops[0])); std::int64_t port=0; if (dst == "al" && parse_int_token(ops[1], port)) { emit8(code,0xE4); emit8(code,port); continue; } if (dst == "al" && lower_copy(ops[1]) == "dx") { emit8(code,0xEC); continue; } if (dst == "eax" && lower_copy(ops[1]) == "dx") { emit8(code,0xED); continue; } }
         throw CompileError("unsupported assembler instruction: " + line);
     }
     for (const auto& [name, addr] : labels) obj.symbols.push_back({name, addr, globals.count(name) != 0});

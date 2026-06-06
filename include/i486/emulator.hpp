@@ -10,10 +10,15 @@ public:
     Memory memory;
     IOBus io;
     CPU486 cpu;
+    std::shared_ptr<PIC8259Device> pic;
     std::shared_ptr<PIT8254> pit;
+    std::shared_ptr<DMA8237Device> dma;
+    std::shared_ptr<RTCDevice> rtc;
     std::shared_ptr<VGADevice> vga;
     std::shared_ptr<SB16Device> sb16;
     std::shared_ptr<KeyboardDevice> keyboard;
+    std::shared_ptr<SerialPortDevice> serial;
+    std::shared_ptr<ParallelPortDevice> parallel;
     std::shared_ptr<BlockStorageDevice> storage;
     std::uint64_t ticks = 0;
 

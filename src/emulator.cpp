@@ -3,8 +3,10 @@
 namespace i486 {
 
 PC486Emulator::PC486Emulator() : memory(), io(), cpu(memory, io) {
-    pit = std::make_shared<PIT8254>(); vga = std::make_shared<VGADevice>(memory); sb16 = std::make_shared<SB16Device>(); keyboard = std::make_shared<KeyboardDevice>();
-    io.register_device(pit); io.register_device(vga); io.register_device(sb16); io.register_device(keyboard);
+    pic = std::make_shared<PIC8259Device>(); pit = std::make_shared<PIT8254>(); dma = std::make_shared<DMA8237Device>(); rtc = std::make_shared<RTCDevice>();
+    vga = std::make_shared<VGADevice>(memory); sb16 = std::make_shared<SB16Device>(); keyboard = std::make_shared<KeyboardDevice>();
+    serial = std::make_shared<SerialPortDevice>(); parallel = std::make_shared<ParallelPortDevice>();
+    io.register_device(pic); io.register_device(pit); io.register_device(dma); io.register_device(rtc); io.register_device(vga); io.register_device(sb16); io.register_device(keyboard); io.register_device(serial); io.register_device(parallel);
 }
 void PC486Emulator::attach_storage(const std::vector<std::uint8_t>& image) { storage = std::make_shared<BlockStorageDevice>(image); io.register_device(storage); }
 void PC486Emulator::boot() {
