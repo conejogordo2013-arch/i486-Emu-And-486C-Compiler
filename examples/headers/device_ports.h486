@@ -1,0 +1,5 @@
+#pragma once
+#define VGA_TEXT_BASE 0xB8000
+#define PIT_COUNTER0  0x40
+#define KEYBOARD_DATA 0x60
+#define SB16_DSP_DATA 0x22C

@@ -6,6 +6,25 @@ namespace i486 {
 namespace {
 constexpr std::uint32_t mask_for(std::uint8_t bits) { return bits == 32 ? 0xFFFFFFFFu : ((1u << bits) - 1u); }
 bool parity8(std::uint8_t value) { value ^= value >> 4; value &= 0xF; return ((0x6996 >> value) & 1) == 0; }
+
+std::uint32_t sign_extend(std::uint32_t value, std::uint8_t bits) {
+    const auto sign = 1u << (bits - 1);
+    return (value ^ sign) - sign;
+}
+
+std::uint32_t rol(std::uint32_t value, std::uint8_t count, std::uint8_t bits) {
+    const auto mask = mask_for(bits);
+    count %= bits;
+    value &= mask;
+    return count == 0 ? value : ((value << count) | (value >> (bits - count))) & mask;
+}
+
+std::uint32_t ror(std::uint32_t value, std::uint8_t count, std::uint8_t bits) {
+    const auto mask = mask_for(bits);
+    count %= bits;
+    value &= mask;
+    return count == 0 ? value : ((value >> count) | (value << (bits - count))) & mask;
+}
 }
 
 std::uint32_t EFlags::pack() const {
@@ -89,6 +108,8 @@ std::uint32_t CPU486::effective_address(const ModRM& m) const {
 }
 std::uint32_t CPU486::read_rm32(const ModRM& m) { return m.mod == 3 ? regs.reg32(m.rm) : static_cast<std::uint32_t>(memory_.read(data_segment(), effective_address(m), 4)); }
 void CPU486::write_rm32(const ModRM& m, std::uint32_t v) { if (m.mod == 3) regs.reg32(m.rm) = v; else memory_.write(data_segment(), effective_address(m), v, 4); }
+std::uint16_t CPU486::read_rm16(const ModRM& m) { return m.mod == 3 ? regs.get16(m.rm) : static_cast<std::uint16_t>(memory_.read(data_segment(), effective_address(m), 2)); }
+void CPU486::write_rm16(const ModRM& m, std::uint16_t v) { if (m.mod == 3) regs.set16(m.rm, v); else memory_.write(data_segment(), effective_address(m), v, 2); }
 std::uint8_t CPU486::read_rm8(const ModRM& m) { return m.mod == 3 ? regs.get8(m.rm) : static_cast<std::uint8_t>(memory_.read(data_segment(), effective_address(m), 1)); }
 void CPU486::write_rm8(const ModRM& m, std::uint8_t v) { if (m.mod == 3) regs.set8(m.rm, v); else memory_.write(data_segment(), effective_address(m), v, 1); }
 void CPU486::push32(std::uint32_t v) { regs.esp -= 4; memory_.write(regs.ss, regs.esp, v, 4); }
@@ -166,6 +187,10 @@ void CPU486::execute_opcode(std::uint8_t op) {
     case 0x3B: { auto m = fetch_modrm(); alu("cmp", regs.reg32(m.reg), read_rm32(m), 32); break; }
     case 0x3C: alu("cmp", regs.get8(0), fetch8(), 8); break;
     case 0x3D: alu("cmp", regs.eax, fetch_imm(), 32); break;
+    case 0x84: { auto m = fetch_modrm(); update_logic_flags(read_rm8(m) & regs.get8(m.reg), 8); flags.CF = flags.OF = false; break; }
+    case 0x85: { auto m = fetch_modrm(); update_logic_flags(read_rm32(m) & regs.reg32(m.reg), 32); flags.CF = flags.OF = false; break; }
+    case 0x86: { auto m = fetch_modrm(); auto lhs = read_rm8(m); auto rhs = regs.get8(m.reg); write_rm8(m, rhs); regs.set8(m.reg, lhs); break; }
+    case 0x87: { auto m = fetch_modrm(); auto lhs = read_rm32(m); auto rhs = regs.reg32(m.reg); write_rm32(m, rhs); regs.reg32(m.reg) = lhs; break; }
     case 0x68: push32(fetch_imm()); break;
     case 0x6A: push32(static_cast<std::uint32_t>(static_cast<std::int8_t>(fetch8()))); break;
     case 0x88: { auto m = fetch_modrm(); write_rm8(m, regs.get8(m.reg)); break; }
@@ -174,14 +199,20 @@ void CPU486::execute_opcode(std::uint8_t op) {
     case 0x8B: { auto m = fetch_modrm(); regs.reg32(m.reg) = read_rm32(m); break; }
     case 0x8D: { auto m = fetch_modrm(); if (!m.has_memory) throw CpuFault("LEA requires memory addressing"); regs.reg32(m.reg) = effective_address(m); break; }
     case 0x90: break;
+    case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: { auto& r = regs.reg32(op - 0x90); std::swap(regs.eax, r); break; }
+    case 0x99: regs.edx = (regs.eax & 0x80000000u) ? 0xFFFFFFFFu : 0; break;
     case 0x9C: push32(flags.pack()); break; case 0x9D: flags.unpack(pop32()); break;
+    case 0xA8: update_logic_flags(regs.get8(0) & fetch8(), 8); flags.CF = flags.OF = false; break;
+    case 0xA9: update_logic_flags(regs.eax & fetch_imm(), 32); flags.CF = flags.OF = false; break;
     case 0xA0: regs.set8(0, memory_.read(data_segment(), fetch32(), 1)); break;
     case 0xA1: regs.eax = static_cast<std::uint32_t>(memory_.read(data_segment(), fetch32(), 4)); break;
     case 0xA2: memory_.write(data_segment(), fetch32(), regs.get8(0), 1); break;
     case 0xA3: memory_.write(data_segment(), fetch32(), regs.eax, 4); break;
     case 0xC3: regs.eip = pop32(); break;
+    case 0xC9: regs.esp = regs.ebp; regs.ebp = pop32(); break;
     case 0xC6: { auto m = fetch_modrm(); if (m.reg != 0) throw CpuFault("bad C6 group"); write_rm8(m, fetch8()); break; }
     case 0xC7: { auto m = fetch_modrm(); if (m.reg != 0) throw CpuFault("bad C7 group"); write_rm32(m, fetch_imm()); break; }
+    case 0xD0: case 0xD1: case 0xD2: case 0xD3: execute_group2(op); break;
     case 0xCD: interrupt(fetch8()); break; case 0xCF: iret(); break;
     case 0xE8: { auto ret = regs.eip + 4; auto d = fetch32(); push32(ret); rel_jump(d, 32); break; }
     case 0xE9: rel_jump(fetch32(), 32); break; case 0xEB: rel_jump(fetch8(), 8); break;
@@ -190,6 +221,7 @@ void CPU486::execute_opcode(std::uint8_t op) {
     case 0xEC: regs.set8(0, io_.in_port(static_cast<std::uint16_t>(regs.edx), 1)); break; case 0xED: regs.eax = io_.in_port(static_cast<std::uint16_t>(regs.edx), 4); break;
     case 0xEE: io_.out_port(static_cast<std::uint16_t>(regs.edx), regs.get8(0), 1); break; case 0xEF: io_.out_port(static_cast<std::uint16_t>(regs.edx), regs.eax, 4); break;
     case 0xF4: halted = true; break; case 0xFA: flags.IF = false; break; case 0xFB: flags.IF = true; break;
+    case 0xF6: case 0xF7: execute_group3(op); break;
     case 0x0F: execute_extended(); break; case 0x80: case 0x81: case 0x83: execute_group1(op); break;
     case 0xD9: case 0xDE: execute_fpu(op); break;
     default:
@@ -206,6 +238,50 @@ void CPU486::execute_group1(std::uint8_t op) {
     else { auto result = alu(name, read_rm32(m), imm, 32); if (name != "cmp") write_rm32(m, result); }
 }
 
+void CPU486::execute_group2(std::uint8_t op) {
+    auto m = fetch_modrm();
+    const auto bits = (op == 0xD0 || op == 0xD2) ? 8 : 32;
+    auto count = (op == 0xD0 || op == 0xD1) ? 1 : (regs.get8(1) & 0x1F);
+    if (count >= bits) count %= bits;
+    if (count == 0) return;
+    const auto mask = mask_for(bits);
+    const auto value = bits == 8 ? read_rm8(m) : read_rm32(m);
+    std::uint32_t result = value & mask;
+    switch (m.reg) {
+    case 0: result = rol(value, count, bits); flags.CF = result & 1u; if (count == 1) flags.OF = ((result >> (bits - 1)) ^ result) & 1u; break;
+    case 1: result = ror(value, count, bits); flags.CF = (result >> (bits - 1)) & 1u; if (count == 1) flags.OF = ((result >> (bits - 1)) ^ (result >> (bits - 2))) & 1u; break;
+    case 4: { const bool cf = (value >> (bits - count)) & 1u; result = (value << count) & mask; update_logic_flags(result, bits); flags.CF = cf; if (count == 1) flags.OF = ((result >> (bits - 1)) ^ flags.CF) & 1u; break; }
+    case 5: { const bool cf = (value >> (count - 1)) & 1u; const bool of = (value >> (bits - 1)) & 1u; result = (value & mask) >> count; update_logic_flags(result, bits); flags.CF = cf; if (count == 1) flags.OF = of; break; }
+    case 7: { const bool cf = (value >> (count - 1)) & 1u; result = static_cast<std::uint32_t>(static_cast<std::int32_t>(sign_extend(value & mask, bits)) >> count) & mask; update_logic_flags(result, bits); flags.CF = cf; if (count == 1) flags.OF = false; break; }
+    default: throw CpuFault("unsupported group2 rotate through carry");
+    }
+    if (bits == 8) write_rm8(m, static_cast<std::uint8_t>(result)); else write_rm32(m, result);
+}
+
+void CPU486::execute_group3(std::uint8_t op) {
+    auto m = fetch_modrm();
+    if (op == 0xF6) {
+        auto value = read_rm8(m);
+        switch (m.reg) {
+        case 0: update_logic_flags(value & fetch8(), 8); flags.CF = flags.OF = false; return;
+        case 2: write_rm8(m, ~value); return;
+        case 3: write_rm8(m, static_cast<std::uint8_t>(alu("sub", 0, value, 8))); return;
+        default: throw CpuFault("unsupported 8-bit group3 op");
+        }
+    }
+    auto value = read_rm32(m);
+    switch (m.reg) {
+    case 0: update_logic_flags(value & fetch_imm(), 32); flags.CF = flags.OF = false; return;
+    case 2: write_rm32(m, ~value); return;
+    case 3: write_rm32(m, alu("sub", 0, value, 32)); return;
+    case 4: { const auto product = static_cast<std::uint64_t>(regs.eax) * value; regs.eax = static_cast<std::uint32_t>(product); regs.edx = static_cast<std::uint32_t>(product >> 32); flags.CF = flags.OF = regs.edx != 0; return; }
+    case 5: { const auto product = static_cast<std::int64_t>(static_cast<std::int32_t>(regs.eax)) * static_cast<std::int64_t>(static_cast<std::int32_t>(value)); regs.eax = static_cast<std::uint32_t>(product); regs.edx = static_cast<std::uint32_t>(product >> 32); flags.CF = flags.OF = product != static_cast<std::int64_t>(static_cast<std::int32_t>(regs.eax)); return; }
+    case 6: if (value == 0) throw CpuFault("division by zero"); regs.edx = regs.eax % value; regs.eax /= value; return;
+    case 7: { if (value == 0) throw CpuFault("division by zero"); const auto dividend = (static_cast<std::uint64_t>(regs.edx) << 32) | regs.eax; const auto q = static_cast<std::int64_t>(dividend) / static_cast<std::int32_t>(value); const auto r = static_cast<std::int64_t>(dividend) % static_cast<std::int32_t>(value); regs.eax = static_cast<std::uint32_t>(q); regs.edx = static_cast<std::uint32_t>(r); return; }
+    default: throw CpuFault("bad group3 op");
+    }
+}
+
 void CPU486::execute_extended() {
     const auto op = fetch8();
     if (op >= 0x80 && op <= 0x8F) {
@@ -213,8 +289,15 @@ void CPU486::execute_extended() {
         if (condition(op & 0x0F)) rel_jump(d, 32);
         return;
     }
-    if (op == 0x20) { regs.eax = regs.cr0; return; }
-    if (op == 0x22) { regs.cr0 = regs.eax; memory_.mode = (regs.cr0 & 1) ? CpuMode::Protected : CpuMode::Real; memory_.paging_enabled = regs.cr0 & 0x80000000u; return; }
+    if (op >= 0x90 && op <= 0x9F) { auto m = fetch_modrm(); write_rm8(m, condition(op & 0x0F) ? 1 : 0); return; }
+    if (op == 0xAF) { auto m = fetch_modrm(); regs.reg32(m.reg) = static_cast<std::uint32_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(regs.reg32(m.reg))) * static_cast<std::int32_t>(read_rm32(m))); update_logic_flags(regs.reg32(m.reg), 32); return; }
+    if (op == 0xB6) { auto m = fetch_modrm(); regs.reg32(m.reg) = read_rm8(m); return; }
+    if (op == 0xBE) { auto m = fetch_modrm(); regs.reg32(m.reg) = sign_extend(read_rm8(m), 8); return; }
+    if (op == 0xB7) { auto m = fetch_modrm(); regs.reg32(m.reg) = read_rm16(m); return; }
+    if (op == 0xBF) { auto m = fetch_modrm(); regs.reg32(m.reg) = sign_extend(read_rm16(m), 16); return; }
+    if (op >= 0xC8 && op <= 0xCF) { auto& r = regs.reg32(op - 0xC8); r = ((r & 0x000000FFu) << 24) | ((r & 0x0000FF00u) << 8) | ((r & 0x00FF0000u) >> 8) | ((r & 0xFF000000u) >> 24); return; }
+    if (op == 0x20) { auto m = fetch_modrm(); regs.reg32(m.rm) = m.reg == 0 ? regs.cr0 : m.reg == 2 ? regs.cr2 : m.reg == 3 ? regs.cr3 : regs.cr4; return; }
+    if (op == 0x22) { auto m = fetch_modrm(); auto value = regs.reg32(m.rm); if (m.reg == 0) { regs.cr0 = value; memory_.mode = (regs.cr0 & 1) ? CpuMode::Protected : CpuMode::Real; memory_.paging_enabled = regs.cr0 & 0x80000000u; } else if (m.reg == 2) regs.cr2 = value; else if (m.reg == 3) regs.cr3 = value; else regs.cr4 = value; return; }
     throw CpuFault("unimplemented 0F opcode");
 }
 

@@ -68,6 +68,32 @@ void test_sib_8bit_and_full_jcc_matrix() {
     assert(cpu.halted);
 }
 
+void test_i486_integer_extensions() {
+    Memory mem;
+    IOBus io;
+    CPU486 cpu(mem, io);
+    cpu.reset();
+    std::vector<std::uint8_t> program = {
+        0xB8, 0xFE, 0xFF, 0xFF, 0xFF,             // mov eax,-2
+        0xBB, 0x03, 0x00, 0x00, 0x00,             // mov ebx,3
+        0x0F, 0xAF, 0xC3,                         // imul eax,ebx
+        0x0F, 0xBE, 0xC8,                         // movsx ecx,al
+        0x0F, 0xB6, 0xD0,                         // movzx edx,al
+        0x0F, 0xC8,                               // bswap eax
+        0xF7, 0xD8,                               // neg eax
+        0x85, 0xC0,                               // test eax,eax
+        0x0F, 0x95, 0xC3,                         // setne bl
+        0xF4,
+    };
+    mem.load(0x7C00, program);
+    for (int i = 0; i < 10; ++i) cpu.step();
+    assert(cpu.regs.ecx == 0xFFFFFFFAu);
+    assert(cpu.regs.edx == 0xFAu);
+    assert(cpu.regs.get8(3) == 1);
+    assert(!cpu.flags.ZF);
+    assert(cpu.halted);
+}
+
 void test_memory_modes_faults() {
     Memory mem;
     mem.write(0, 0x100, 0xAA, 1);
@@ -123,6 +149,45 @@ void test_486cc_compiler_pipeline() {
     assert(result.assembly.find("global main") != std::string::npos);
     assert(result.assembly.find("mov eax, 3") != std::string::npos);
     assert(result.assembly.find("ret") != std::string::npos);
+
+    auto advanced = compiler.compile_to_asm("int add(int a,int b){ int c = (a + b) % 5; if (c >= 3) return c; return c != 0; }");
+    assert(advanced.assembly.find("[ebp+8]") != std::string::npos);
+    assert(advanced.assembly.find("mov ecx, 5") != std::string::npos);
+    assert(advanced.assembly.find("setge al") != std::string::npos);
+    assert(advanced.assembly.find("setne al") != std::string::npos);
+}
+
+void test_assembler_and_linker_pipeline() {
+    c486cc::Assembler486 assembler;
+    const auto image = assembler.assemble_flat(R"asm(
+        bits 32
+        global _start
+    _start:
+        mov eax, 1
+        add eax, 2
+        cmp eax, 3
+        jne failed
+        mov ebx, 0x12345678
+        hlt
+    failed:
+        mov ebx, 0
+        hlt
+    )asm");
+    Memory mem;
+    IOBus io;
+    CPU486 cpu(mem, io);
+    cpu.reset();
+    mem.load(0x7C00, image);
+    for (int i = 0; i < 16 && !cpu.halted; ++i) cpu.step();
+    assert(cpu.regs.eax == 3);
+    assert(cpu.regs.ebx == 0x12345678u);
+    assert(cpu.halted);
+
+    c486cc::Toolchain486 toolchain;
+    const auto compiled = toolchain.compile_c486_to_asm("int main(){ int x = 7 % 4; return x == 3; }");
+    const auto obj = toolchain.assemble(compiled.assembly);
+    const auto bin = toolchain.link_flat({obj});
+    assert(!bin.empty());
 }
 
 int main() {
@@ -130,8 +195,10 @@ int main() {
     test_modrm_memory_and_group1();
     test_memory_modes_faults();
     test_sib_8bit_and_full_jcc_matrix();
+    test_i486_integer_extensions();
     test_boot_vga_sb16_interrupt();
     test_486cc_compiler_pipeline();
+    test_assembler_and_linker_pipeline();
     std::cout << "i486 C++ emulator tests OK\n";
     return 0;
 }
