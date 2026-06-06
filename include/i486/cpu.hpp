@@ -18,7 +18,7 @@ struct EFlags {
     bool CF = false, PF = false, AF = false, ZF = false, SF = false;
     bool TF = false, IF = true, DF = false, OF = false;
     std::uint8_t IOPL = 0;
-    bool NT = false, RF = false, VM = false, AC = false;
+    bool NT = false, RF = false, VM = false, AC = false, ID = false;
     std::uint32_t pack() const;
     void unpack(std::uint32_t value);
 };
@@ -39,15 +39,36 @@ class FPUx87 {
 public:
     std::uint16_t control = 0x037F;
     std::uint16_t status = 0;
+    std::uint16_t tag = 0xFFFF;
     void fld(double value);
     double fst(bool pop = false);
-    void fadd();
-    void fmul();
-    void fdiv();
+    void fadd(std::size_t index = 1, bool pop = true);
+    void fsub(std::size_t index = 1, bool pop = true);
+    void fmul(std::size_t index = 1, bool pop = true);
+    void fdiv(std::size_t index = 1, bool pop = true);
+    void fsqrt();
+    int fcom(std::size_t index = 1);
     std::size_t depth() const { return stack_.size(); }
     double st(std::size_t index) const;
 private:
+    void refresh_status();
     std::vector<double> stack_;
+};
+
+struct DescriptorTableCache {
+    DescriptorTableRegister gdtr{};
+    DescriptorTableRegister idtr{};
+    DescriptorTableRegister ldtr{};
+    std::uint16_t tr = 0;
+};
+
+struct TimingModel486 {
+    std::uint32_t base_cycles = 1;
+    std::uint32_t memory_wait_states = 0;
+    std::uint64_t prefetch_flushes = 0;
+    std::uint64_t pipeline_stalls = 0;
+    std::uint64_t cache_hits = 0;
+    std::uint64_t cache_misses = 0;
 };
 
 struct ModRM {
@@ -67,6 +88,8 @@ public:
     bool halted = false;
     std::uint64_t cycles = 0;
     std::array<std::pair<std::uint16_t, std::uint32_t>, 256> idt{};
+    DescriptorTableCache tables{};
+    TimingModel486 timing{};
 
     void reset(bool dev_boot = true);
     std::uint32_t step();
@@ -97,8 +120,12 @@ private:
     std::uint8_t read_rm8(const ModRM& modrm);
     void write_rm8(const ModRM& modrm, std::uint8_t value);
 
+    void push16(std::uint16_t value);
+    std::uint16_t pop16();
     void push32(std::uint32_t value);
     std::uint32_t pop32();
+    void push(std::uint32_t value);
+    std::uint32_t pop();
     void rel_jump(std::uint32_t displacement, std::uint8_t bits);
     std::uint32_t alu(const std::string& op, std::uint32_t a, std::uint32_t b, std::uint8_t bits);
     void update_logic_flags(std::uint32_t result, std::uint8_t bits);
@@ -108,6 +135,9 @@ private:
     void execute_group2(std::uint8_t opcode);
     void execute_group3(std::uint8_t opcode);
     void execute_fpu(std::uint8_t opcode);
+    void load_table_register(DescriptorTableRegister& reg, const ModRM& modrm);
+    void store_table_register(const DescriptorTableRegister& reg, const ModRM& modrm);
+    void raise_fault(std::uint8_t vector, std::uint32_t error_code = 0);
     bool condition(std::uint8_t jcc) const;
 };
 
