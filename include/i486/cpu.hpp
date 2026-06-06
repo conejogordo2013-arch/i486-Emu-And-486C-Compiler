@@ -27,6 +27,7 @@ struct Registers {
     std::uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0, esi = 0, edi = 0, esp = 0x7C00, ebp = 0, eip = 0;
     std::uint16_t cs = 0, ds = 0, es = 0, fs = 0, gs = 0, ss = 0;
     std::uint32_t cr0 = 0, cr2 = 0, cr3 = 0, cr4 = 0;
+    std::array<std::uint32_t, 8> dr{};
     std::uint32_t& reg32(std::uint8_t index);
     const std::uint32_t& reg32(std::uint8_t index) const;
     std::uint8_t get8(std::uint8_t index) const;
@@ -47,6 +48,22 @@ public:
     void fmul(std::size_t index = 1, bool pop = true);
     void fdiv(std::size_t index = 1, bool pop = true);
     void fsqrt();
+    void finit();
+    void fchs();
+    void fabs();
+    void fsin();
+    void fcos();
+    void fsincos();
+    void fptan();
+    void fpatan();
+    void f2xm1();
+    void fyl2x();
+    void fyl2xp1();
+    void fxch(std::size_t index);
+    void ffree(std::size_t index);
+    void fst_to(std::size_t index, bool pop = false);
+    void ftst();
+    void fxam();
     int fcom(std::size_t index = 1);
     std::size_t depth() const { return stack_.size(); }
     double st(std::size_t index) const;
@@ -69,6 +86,13 @@ struct TimingModel486 {
     std::uint64_t pipeline_stalls = 0;
     std::uint64_t cache_hits = 0;
     std::uint64_t cache_misses = 0;
+    std::uint64_t locked_cycles = 0;
+};
+
+struct CacheLine486 {
+    bool valid = false;
+    bool dirty = false;
+    std::uint32_t tag = 0;
 };
 
 struct ModRM {
@@ -104,6 +128,10 @@ private:
     bool address32_ = true;
     std::uint16_t segment_override_ = 0;
     bool has_segment_override_ = false;
+    bool rep_prefix_ = false;
+    bool repne_prefix_ = false;
+    bool lock_prefix_ = false;
+    std::array<CacheLine486, 512> l1_cache_{};
 
     std::uint8_t fetch8();
     std::uint16_t fetch16();
@@ -112,6 +140,14 @@ private:
     ModRM fetch_modrm();
     std::uint32_t effective_address(const ModRM& modrm) const;
     std::uint16_t data_segment() const;
+    std::uint16_t segment_register(std::uint8_t index) const;
+    void set_segment_register(std::uint8_t index, std::uint16_t value);
+    std::uint32_t string_count() const;
+    void set_string_count(std::uint32_t value);
+    void advance_string(std::uint32_t& reg, std::uint8_t size);
+    void execute_string(std::uint8_t opcode);
+    void touch_cache(std::uint32_t linear_address, bool write);
+    void invalidate_cache(bool write_back);
 
     std::uint32_t read_rm32(const ModRM& modrm);
     void write_rm32(const ModRM& modrm, std::uint32_t value);
@@ -135,6 +171,7 @@ private:
     void execute_group2(std::uint8_t opcode);
     void execute_group3(std::uint8_t opcode);
     void execute_fpu(std::uint8_t opcode);
+    void load_far_pointer(const ModRM& modrm, std::uint8_t segment_index);
     void load_table_register(DescriptorTableRegister& reg, const ModRM& modrm);
     void store_table_register(const DescriptorTableRegister& reg, const ModRM& modrm);
     void raise_fault(std::uint8_t vector, std::uint32_t error_code = 0);
